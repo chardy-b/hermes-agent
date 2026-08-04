@@ -42,13 +42,13 @@
   gnugrep,
   gnused,
   gzip,
-  netcat-gnu,
   nodejs_22,
   openssl,
   python3,
   slirp4netns,
   stdenv,
   gnutar,
+  util-linux,
 
   # etc
   writeShellApplication,
@@ -101,13 +101,13 @@ writeShellApplication {
     gnugrep
     gnused
     gzip
-    netcat-gnu
     nodejs_22
     openssl
     python3
     slirp4netns
     stdenv.cc
     gnutar
+    util-linux
   ]
   ++ electronRuntime;
   text = ''
@@ -115,6 +115,10 @@ writeShellApplication {
     export DEV_SANDBOX_DYNAMIC_LINKER=${stdenv.cc.bintools.dynamicLinker}
     export DEV_SANDBOX_NODE_DIR=${nodejs_22}
     export DEV_SANDBOX_ELECTRON_LD_LIBRARY_PATH=${lib.makeLibraryPath electronRuntime}
+    # The script is imported into the store as a single file, so its own
+    # directory has no scripts/sandbox/ beside it. Point it at the assets
+    # (fake-internet proxy, ssh shim) explicitly.
+    export DEV_SANDBOX_ASSETS=${../scripts/sandbox}
     exec ${../scripts/dev-sandbox.sh} "$@"
   '';
 }

@@ -1,153 +1,31 @@
 #!/usr/bin/env bash
 # Run a command in a disposable, network-isolated fake Internet.
 #
-# The command runs in bubblewrap's private user, mount, PID, and network
-# namespaces.  Its only writable filesystem is SANDBOX_ROOT.  HTTP(S) goes to
-# a local static MITM proxy. github.com SSH uses a sandbox-local git-upload-pack
-# shim; neither transport can reach the host network.
+# The command runs in private user, mount, PID, and network namespaces. This
+# script is stage 1: it builds the sandbox tree, mints the fake CA, and creates
+# the user+network namespaces with `unshare` (see the namespace plan further
+# down), then re-execs into scripts/sandbox/stage2-run.sh, which adds the
+# mount/pid namespaces with bubblewrap and runs the payload. Its only writable
+# filesystem is SANDBOX_ROOT. HTTP(S) goes to a local static MITM proxy;
+# github.com SSH uses a sandbox-local git-upload-pack shim; neither transport
+# can reach the host network.
 
 set -euo pipefail
 
-if [ "${1:-}" = "--internal-run" ]; then
-  shift
-  : "${DEV_SANDBOX_ROOT:?missing DEV_SANDBOX_ROOT}"
-  : "${DEV_SANDBOX_BASH:?missing DEV_SANDBOX_BASH}"
-  : "${DEV_SANDBOX_SLIRP4NETNS:?missing DEV_SANDBOX_SLIRP4NETNS}"
-  : "${DEV_SANDBOX_INTERACTIVE:?missing DEV_SANDBOX_INTERACTIVE}"
-
-  node_env=()
-  if [ -n "${DEV_SANDBOX_NODE_DIR:-}" ]; then
-    node_env+=(--setenv npm_config_nodedir "$DEV_SANDBOX_NODE_DIR")
-  fi
-  electron_env=()
-  if [ -n "${DEV_SANDBOX_ELECTRON_LD_LIBRARY_PATH:-}" ]; then
-    electron_env+=(
-      --setenv LD_LIBRARY_PATH "$DEV_SANDBOX_ELECTRON_LD_LIBRARY_PATH"
-      --setenv HERMES_DESKTOP_DISABLE_GPU 1
-    )
-  fi
-  gui_mounts=()
-  if [ -n "${DEV_SANDBOX_WAYLAND_SOCKET:-}" ]; then
-    runtime_dir="${DEV_SANDBOX_XDG_RUNTIME_DIR:?missing DEV_SANDBOX_XDG_RUNTIME_DIR}"
-    runtime_parent="$(dirname "$runtime_dir")"
-    runtime_grandparent="$(dirname "$runtime_parent")"
-    gui_mounts+=(
-      --dir "$runtime_grandparent"
-      --dir "$runtime_parent"
-      --dir "$runtime_dir"
-      --bind "$DEV_SANDBOX_WAYLAND_SOCKET" "$DEV_SANDBOX_WAYLAND_SOCKET"
-      --setenv XDG_RUNTIME_DIR "$runtime_dir"
-      --setenv WAYLAND_DISPLAY "${DEV_SANDBOX_WAYLAND_DISPLAY:?missing DEV_SANDBOX_WAYLAND_DISPLAY}"
-    )
-  fi
-
-  runtime_mounts=()
-  if [ -d /nix ] && [[ "$(readlink -f "$DEV_SANDBOX_BASH")" == /nix/* ]]; then
-    runtime_mounts+=(--ro-bind /nix /nix)
-  else
-    # Non-Nix Linux distributions keep dynamic executables and their loaders
-    # below these system paths.  They are read-only in the sandbox.
-    for path in /usr /bin /sbin /lib /lib64; do
-      [ -e "$path" ] && runtime_mounts+=(--ro-bind "$path" "$path")
-    done
-  fi
-
-  sandbox_info="$DEV_SANDBOX_ROOT/root/logs/bwrap-info.json"
-  : > "$sandbox_info"
-  bwrap \
-    --unshare-user --uid 0 --gid 0 --unshare-pid --unshare-net \
-    --die-with-parent --proc /proc --dev /dev --tmpfs /tmp \
-    "${gui_mounts[@]}" \
-    "${runtime_mounts[@]}" \
-    --dir /usr \
-    --dir /bin \
-    --dir /lib64 \
-    --bind "$DEV_SANDBOX_ROOT/root" /work \
-    --bind "$DEV_SANDBOX_ROOT/root/bin" /bin \
-    --bind "$DEV_SANDBOX_ROOT/root/lib64" /lib64 \
-    --bind "$DEV_SANDBOX_ROOT/root/usr/bin" /usr/bin \
-    --bind "$DEV_SANDBOX_ROOT/root/usr/local" /usr/local \
-    --bind "$DEV_SANDBOX_ROOT/home" /root \
-    --bind "$DEV_SANDBOX_ROOT/etc" /etc \
-    --chdir /work/repo \
-    --clearenv \
-    --setenv PATH "/usr/local/bin:/usr/bin:$PATH" \
-    --setenv HOME /root \
-    --setenv USER root \
-    --setenv LOGNAME root \
-    --setenv CURL_CA_BUNDLE /work/certs/ca.pem \
-    --setenv SSL_CERT_FILE /work/certs/ca.pem \
-    --setenv GIT_SSL_CAINFO /work/certs/ca.pem \
-    --setenv NODE_EXTRA_CA_CERTS /work/certs/real-ca.pem \
-    --setenv HTTP_PROXY http://127.0.0.1:8080 \
-    --setenv HTTPS_PROXY http://127.0.0.1:8080 \
-    --setenv ALL_PROXY http://127.0.0.1:8080 \
-    --setenv NO_PROXY '' \
-    --setenv DEV_SANDBOX_INTERACTIVE "$DEV_SANDBOX_INTERACTIVE" \
-    --setenv ELECTRON_DISABLE_SANDBOX 1 \
-    "${node_env[@]}" \
-    "${electron_env[@]}" \
-    --info-fd 3 \
-    -- "$DEV_SANDBOX_BASH" -ceu '
-      python3 /work/proxy.py /work/http /work/certs /work/certs/real-ca.pem >/work/logs/proxy.log 2>&1 &
-      proxy_pid=$!
-      cleanup() {
-        kill "$proxy_pid" 2>/dev/null || true
-        wait "$proxy_pid" 2>/dev/null || true
-      }
-      trap cleanup EXIT INT TERM
-      for _ in $(seq 1 50); do
-        nc -z 127.0.0.1 8080 && break
-        sleep 0.05
-      done
-      if ! nc -z 127.0.0.1 8080; then
-        cat /work/logs/proxy.log >&2 || true
-        exit 1
-      fi
-      "$@"
-    ' sandbox-command "$@" 3>"$sandbox_info" &
-  bwrap_pid=$!
-  for _ in $(seq 1 100); do
-    [ -s "$sandbox_info" ] && break
-    if ! kill -0 "$bwrap_pid" 2>/dev/null; then
-      wait "$bwrap_pid"
-      exit $?
-    fi
-    sleep 0.05
-  done
-  sandbox_pid="$(awk -F: '/"child-pid"/ {gsub(/[^0-9]/, "", $2); print $2}' "$sandbox_info")"
-  if [ -z "$sandbox_pid" ]; then
-    echo 'error: Bubblewrap did not report a sandbox child PID' >&2
-    exit 1
-  fi
-  slirp_ready="$DEV_SANDBOX_ROOT/root/logs/slirp.ready"
-  : > "$slirp_ready"
-  "$DEV_SANDBOX_SLIRP4NETNS" --configure --disable-host-loopback --ready-fd=3 \
-    --userns-path="/proc/$sandbox_pid/ns/user" "$sandbox_pid" tap0 \
-    3>"$slirp_ready" >"$DEV_SANDBOX_ROOT/root/logs/slirp.log" 2>&1 &
-  slirp_pid=$!
-  cleanup() {
-    kill "$slirp_pid" 2>/dev/null || true
-    wait "$slirp_pid" 2>/dev/null || true
-  }
-  trap cleanup EXIT INT TERM
-  for _ in $(seq 1 100); do
-    [ -s "$slirp_ready" ] && break
-    if ! kill -0 "$slirp_pid" 2>/dev/null; then
-      cat "$DEV_SANDBOX_ROOT/root/logs/slirp.log" >&2 || true
-      exit 1
-    fi
-    sleep 0.05
-  done
-  if [ ! -s "$slirp_ready" ]; then
-    echo 'error: timed out waiting for sandbox network setup' >&2
-    exit 1
-  fi
-  wait "$bwrap_pid"
-  exit $?
-fi
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Helper files the sandbox needs: the stage-2 script it re-execs into, plus the
+# files it copies in (the fake-internet proxy, the ssh shim, the openssl config).
+# They sit next to this script in the repo, but the Nix wrapper installs the
+# script into the store on its own, so it exports DEV_SANDBOX_ASSETS to point
+# here.
+SANDBOX_ASSETS="${DEV_SANDBOX_ASSETS:-$SCRIPT_DIR/sandbox}"
+for asset in proxy.py ssh-shim.sh openssl.cnf stage2-run.sh; do
+  [ -f "$SANDBOX_ASSETS/$asset" ] || {
+    echo "error: missing sandbox asset: $SANDBOX_ASSETS/$asset" >&2
+    exit 1
+  }
+done
 
 print_help() {
   cat <<'EOF'
@@ -160,6 +38,9 @@ writable host mounts: only its own root, mounted at /work, is writable.
 Options:
   --persistent          Keep the whole sandbox under .hermes-sandbox/.
   --delete              Delete the persistent sandbox (asks first).
+  --root                Install as uid 0 with the root FHS layout: code in
+                        /usr/local/lib/hermes-agent, command in
+                        /usr/local/bin. Default is the user-level layout.
   --from DIR            One-time copy of DIR into the sandbox's $HOME.
                         Existing persistent sandboxes are never overwritten.
   --http-root DIR       Copy DIR into the fake web server root for this run.
@@ -169,7 +50,31 @@ Options:
   --from-main           With `install`, fetch the real upstream main installer
                         and repository, then advance fake main to this folder
                         after a successful install for update testing.
+                        Shorthand for --install-ref refs/heads/main.
+  --install-ref REF     Like --from-main, but installs REF instead of main:
+                        a branch, a tag (v2026.7.7), or a SHA reachable from main.
+                        Use it to test updating from an older release, not just
+                        from the tip.
   -h, --help            Show this help.
+
+Option order matters: every option above is consumed by THIS script, and
+parsing stops at the first argument it does not recognize. Everything from
+that point on is passed through to the command (or, with `install`, to the
+installer). Put sandbox options first and separate installer arguments with
+`--`, otherwise they arrive here and fail:
+
+  # WRONG — --from-main reaches install.sh, which rejects it
+  scripts/dev-sandbox.sh install --skip-setup --from-main
+
+  # RIGHT
+  scripts/dev-sandbox.sh install --from-main -- --skip-setup
+
+Install layout: `install.sh` picks its layout from `id -u` alone, so uid is what
+separates the two real-world Linux installs. By default the sandbox runs as an
+unprivileged `hermes` user, giving the layout most people have —
+$HERMES_HOME/hermes-agent plus a ~/.local/bin launcher. Pass --root for the FHS
+one. Both are worth testing; they differ in more than paths (root also relocates
+uv's Python to /usr/local/share for world-readability).
 
 The fake web server signs certificates with a CA trusted only inside this
 sandbox. HTTP_PROXY/HTTPS_PROXY send fixture URLs there first; other HTTP(S)
@@ -181,10 +86,14 @@ Fake github main always comes from this folder. If it has staged, unstaged, or
 non-ignored untracked changes, the sandbox warns and creates a temporary local
 commit containing them; it never stages or commits the real worktree.
 
+Environment:
+  HERMES_DEV_SANDBOX_DIR    Sandbox directory name, relative to the repo root
+                            (default: .hermes-sandbox).
+
 Examples:
   # create a sandbox, install this branch as `main`, and then drop to a shell,
   # skipping `hermes setup` & the browser tools for speed.
-  scripts/dev-sandbox.sh install --persistent --skip-setup --skip-browser
+  scripts/dev-sandbox.sh install --persistent -- --skip-setup --skip-browser
 
   # Install the official upstream main. You're dropped into a shell where
   # you can run `hermes update`.
@@ -195,11 +104,18 @@ EOF
 
 PERSISTENT=false
 DELETE=false
+RUN_AS_USER=true
 SEED_DIR=""
 HTTP_ROOT=""
 INSTALL_SHORTCUT=false
 INSTALLER_PATH=""
-INSTALL_FROM_MAIN=false
+# Which upstream commit the sandbox installs before the update routes run.
+# Empty means "install this worktree's own installer" (no upstream fetch); set,
+# it is anything git can resolve -- a branch, a tag (v2026.7.7), or a SHA
+# reachable from main -- so "can a user two releases back still update?" is
+# expressible. --from-main is shorthand for refs/heads/main.
+INSTALL_REF=""
+UPSTREAM_URL="${HERMES_DEV_SANDBOX_UPSTREAM:-https://github.com/NousResearch/hermes-agent.git}"
 
 if [ "${1:-}" = install ]; then
   INSTALL_SHORTCUT=true
@@ -210,6 +126,8 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --persistent) PERSISTENT=true; shift ;;
     --delete) DELETE=true; shift ;;
+    --root) RUN_AS_USER=false; shift ;;
+    --user) RUN_AS_USER=true; shift ;;   # the default; accepted for symmetry
     --from)
       [ "$#" -ge 2 ] || { echo 'error: --from needs a directory' >&2; exit 1; }
       SEED_DIR="$2"; shift 2 ;;
@@ -219,14 +137,19 @@ while [ "$#" -gt 0 ]; do
     --installer)
       [ "$#" -ge 2 ] || { echo 'error: --installer needs a file' >&2; exit 1; }
       INSTALLER_PATH="$2"; shift 2 ;;
-    --from-main) INSTALL_FROM_MAIN=true; shift ;;
-    --from=*|--http-root=*|--installer=*)
+    --from-main) INSTALL_REF="refs/heads/main"; shift ;;
+    --install-ref)
+      [ "$#" -ge 2 ] || { echo 'error: --install-ref needs a value' >&2; exit 1; }
+      INSTALL_REF="$2"
+      shift 2 ;;
+    --from=*|--http-root=*|--installer=*|--install-ref=*)
       key="${1%%=*}"; value="${1#*=}"
       [ -n "$value" ] || { echo "error: $key needs a value" >&2; exit 1; }
       case "$key" in
         --from) SEED_DIR="$value" ;;
         --http-root) HTTP_ROOT="$value" ;;
         --installer) INSTALLER_PATH="$value" ;;
+        --install-ref) INSTALL_REF="$value" ;;
       esac
       shift ;;
     -h|--help) print_help; exit 0 ;;
@@ -244,12 +167,12 @@ if [ -n "$INSTALLER_PATH" ] && [ "$INSTALL_SHORTCUT" = false ]; then
   echo 'error: --installer is only valid with the install shortcut' >&2
   exit 1
 fi
-if [ "$INSTALL_FROM_MAIN" = true ] && [ "$INSTALL_SHORTCUT" = false ]; then
-  echo 'error: --from-main is only valid with the install shortcut' >&2
+if [ -n "$INSTALL_REF" ] && [ "$INSTALL_SHORTCUT" = false ]; then
+  echo 'error: --from-main / --install-ref are only valid with the install shortcut' >&2
   exit 1
 fi
-if [ "$INSTALL_FROM_MAIN" = true ] && [ -n "$INSTALLER_PATH" ]; then
-  echo 'error: --from-main and --installer cannot be combined' >&2
+if [ -n "$INSTALL_REF" ] && [ -n "$INSTALLER_PATH" ]; then
+  echo 'error: --from-main / --install-ref cannot be combined with --installer' >&2
   exit 1
 fi
 
@@ -259,7 +182,7 @@ done
 
 GIT_ROOT="${HERMES_SANDBOX_SOURCE_ROOT:-$(git rev-parse --show-toplevel)}"
 GIT_ROOT="$(cd "$GIT_ROOT" && pwd)"
-if [ "$INSTALL_SHORTCUT" = true ] && [ "$INSTALL_FROM_MAIN" = false ] && [ -z "$INSTALLER_PATH" ]; then
+if [ "$INSTALL_SHORTCUT" = true ] && [ -z "$INSTALL_REF" ] && [ -z "$INSTALLER_PATH" ]; then
   INSTALLER_PATH="$GIT_ROOT/scripts/install.sh"
 fi
 if [ -n "$INSTALLER_PATH" ] && [ ! -f "$INSTALLER_PATH" ]; then
@@ -297,16 +220,29 @@ fi
 mkdir -p "$SANDBOX_ROOT"/{root,home,etc}
 UPSTREAM_REPO=""
 UPSTREAM_COMMIT=""
-if [ "$INSTALL_FROM_MAIN" = true ]; then
-  echo '[sandbox] fetching real upstream main for installer/update test' >&2
+if [ -n "$INSTALL_REF" ]; then
+  echo "[sandbox] fetching upstream $INSTALL_REF for installer/update test" >&2
   UPSTREAM_REPO="$(mktemp -d -t hermes-sandbox-upstream.XXXXXX)"
   git -C "$UPSTREAM_REPO" init -q
-  if ! git -C "$UPSTREAM_REPO" fetch -q https://github.com/NousResearch/hermes-agent.git refs/heads/main; then
+  # Fetch the ref as given. A branch or tag name resolves on its own; a raw SHA
+  # needs the remote to allow fetching it directly, so fall back to fetching
+  # main and resolving the SHA locally (which works for any commit that is an
+  # ancestor of main -- the interesting case for "update from N versions ago").
+  #
+  # Peel to ^{commit} in both cases: an annotated tag fetches as a tag OBJECT,
+  # and using it directly fails later with "trying to write non-commit object
+  # ... to branch 'refs/heads/main'".
+  if git -C "$UPSTREAM_REPO" fetch -q "$UPSTREAM_URL" "$INSTALL_REF" 2>/dev/null; then
+    UPSTREAM_COMMIT="$(git -C "$UPSTREAM_REPO" rev-parse "FETCH_HEAD^{commit}")"
+  elif git -C "$UPSTREAM_REPO" fetch -q "$UPSTREAM_URL" refs/heads/main \
+    && UPSTREAM_COMMIT="$(git -C "$UPSTREAM_REPO" rev-parse --verify -q "$INSTALL_REF^{commit}")"; then
+    :
+  else
     rm -rf -- "$UPSTREAM_REPO"
-    echo 'error: failed to fetch real upstream main' >&2
+    echo "error: could not resolve upstream ref: $INSTALL_REF" >&2
+    echo '       Use a branch (main), a tag (v2026.7.7), or a SHA reachable from main.' >&2
     exit 1
   fi
-  UPSTREAM_COMMIT="$(git -C "$UPSTREAM_REPO" rev-parse FETCH_HEAD)"
 fi
 if [ ! -e "$SANDBOX_ROOT/root/repo/.sandbox-source" ]; then
   mkdir -p "$SANDBOX_ROOT/root/repo"
@@ -331,7 +267,7 @@ if [ -n "$HTTP_ROOT" ]; then
 fi
 if [ "$INSTALL_SHORTCUT" = true ]; then
   mkdir -p "$SANDBOX_ROOT/root/http/hermes-agent.nousresearch.com"
-  if [ "$INSTALL_FROM_MAIN" = true ]; then
+  if [ -n "$INSTALL_REF" ]; then
     git -C "$UPSTREAM_REPO" show "$UPSTREAM_COMMIT:scripts/install.sh" \
       > "$SANDBOX_ROOT/root/http/hermes-agent.nousresearch.com/install.sh"
   else
@@ -381,7 +317,18 @@ printf 'nameserver 10.0.2.3\n' > "$SANDBOX_ROOT/etc/resolv.conf"
 SANDBOX_SHELL="$(command -v bash)"
 DYNAMIC_LINKER="${DEV_SANDBOX_DYNAMIC_LINKER:-}"
 if [ -z "$DYNAMIC_LINKER" ]; then
-  for candidate in /nix/store/*-glibc-*/lib/ld-linux-*.so.*; do
+  # Nix store first: NixOS also ships a /lib64/ld-linux-x86-64.so.2 compat stub,
+  # so probing FHS paths first would quietly switch which loader a bare script
+  # invocation uses on this host. Globs that match nothing expand to themselves,
+  # so every candidate is -f tested. The FHS paths cover Debian/Ubuntu (where
+  # the loader is under /lib64 or a multiarch /lib dir), which is what CI runs.
+  for candidate in \
+    /nix/store/*-glibc-*/lib/ld-linux-*.so.* \
+    /lib64/ld-linux-x86-64.so.2 \
+    /lib/ld-linux-aarch64.so.1 \
+    /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 \
+    /lib/aarch64-linux-gnu/ld-linux-aarch64.so.1
+  do
     if [ -f "$candidate" ]; then
       DYNAMIC_LINKER="$candidate"
       break
@@ -390,14 +337,44 @@ if [ -z "$DYNAMIC_LINKER" ]; then
 fi
 if [ ! -f "$DYNAMIC_LINKER" ]; then
   echo 'error: no glibc dynamic linker found for sandboxed release binaries' >&2
+  echo '       Set DEV_SANDBOX_DYNAMIC_LINKER to its path.' >&2
   exit 1
 fi
 ln -sf "$SANDBOX_SHELL" "$SANDBOX_ROOT/root/bin/sh"
 ln -sf "$(command -v ls)" "$SANDBOX_ROOT/root/bin/ls"
 ln -sf "$(command -v env)" "$SANDBOX_ROOT/root/usr/bin/env"
 ln -sf "$DYNAMIC_LINKER" "$SANDBOX_ROOT/root/lib64/$(basename "$DYNAMIC_LINKER")"
-printf 'root:x:0:0:Sandbox Root:/root:%s\n' "$SANDBOX_SHELL" > "$SANDBOX_ROOT/etc/passwd"
-printf 'root:x:0:\n' > "$SANDBOX_ROOT/etc/group"
+# Identity inside the sandbox. install.sh chooses its layout from `id -u`
+# alone (see resolve_install_layout), so the uid here is what decides between
+# the root FHS install and a user-level one.
+if [ "$RUN_AS_USER" = true ]; then
+  SANDBOX_UID=1000
+  SANDBOX_GID=1000
+  SANDBOX_USER=hermes
+  SANDBOX_HOME=/home/hermes
+else
+  SANDBOX_UID=0
+  SANDBOX_GID=0
+  SANDBOX_USER=root
+  SANDBOX_HOME=/root
+fi
+{
+  printf 'root:x:0:0:Sandbox Root:/root:%s\n' "$SANDBOX_SHELL"
+  if [ "$RUN_AS_USER" = true ]; then
+    printf '%s:x:%s:%s:Sandbox User:%s:%s\n' \
+      "$SANDBOX_USER" "$SANDBOX_UID" "$SANDBOX_GID" "$SANDBOX_HOME" "$SANDBOX_SHELL"
+  fi
+} > "$SANDBOX_ROOT/etc/passwd"
+{
+  printf 'root:x:0:\n'
+  if [ "$RUN_AS_USER" = true ]; then
+    printf '%s:x:%s:\n' "$SANDBOX_USER" "$SANDBOX_GID"
+  fi
+} > "$SANDBOX_ROOT/etc/group"
+# A user-level install writes the `hermes` launcher to ~/.local/bin and the
+# checkout to $HERMES_HOME; both live under the sandbox HOME, which is bound
+# from $SANDBOX_ROOT/home. bwrap maps our real uid to $SANDBOX_UID, so the
+# host-side ownership of that directory is what the sandbox sees as its own.
 printf 'hosts: files dns\n' > "$SANDBOX_ROOT/etc/nsswitch.conf"
 printf '127.0.0.1 localhost\n' > "$SANDBOX_ROOT/etc/hosts"
 
@@ -406,7 +383,7 @@ SOURCE_REF="$COMMIT"
 SNAPSHOT_REPO=""
 FAKE_REPO="$SANDBOX_ROOT/root/repos/hermes-agent.git"
 git -C "$SANDBOX_ROOT/root/repos" init --bare -q hermes-agent.git
-if [ "$INSTALL_FROM_MAIN" = true ]; then
+if [ -n "$INSTALL_REF" ]; then
   git --git-dir="$FAKE_REPO" fetch -q --force "$UPSTREAM_REPO" \
     "$UPSTREAM_COMMIT:refs/heads/main"
 fi
@@ -431,7 +408,7 @@ if [ -n "$(git -C "$GIT_ROOT" status --porcelain)" ]; then
   SOURCE_REPO="$SNAPSHOT_REPO"
 fi
 
-if [ "$INSTALL_FROM_MAIN" = true ]; then
+if [ -n "$INSTALL_REF" ]; then
   git --git-dir="$FAKE_REPO" fetch -q --force "$SOURCE_REPO" \
     "$SOURCE_REF:refs/hermes-sandbox/next"
   printf '%s\n' "$SOURCE_REF" > "$SANDBOX_ROOT/root/promote-main"
@@ -441,165 +418,58 @@ else
 fi
 git --git-dir="$FAKE_REPO" symbolic-ref HEAD refs/heads/main
 if [ -n "$SNAPSHOT_REPO" ]; then
-  rm -rf -- "$SNAPSHOT_REPO"
+  # Best-effort: it is a mktemp directory the OS will reap, and failing the whole
+  # run over a leftover object file would be worse than leaking it. Concurrent
+  # git activity in the worktree can still be writing here as we delete.
+  rm -rf -- "$SNAPSHOT_REPO" 2>/dev/null || true
 fi
 if [ -n "$UPSTREAM_REPO" ]; then
   rm -rf -- "$UPSTREAM_REPO"
 fi
 
+# openssl reads a config even for `req -addext`, and its compiled-in path is a
+# symlink into /etc/ssl on Debian/Ubuntu -- which the sandbox replaces. Ship our
+# own and point OPENSSL_CONF at it, both here and inside the sandbox.
+cp "$SANDBOX_ASSETS/openssl.cnf" "$SANDBOX_ROOT/root/certs/openssl.cnf"
+
 if [ ! -f "$SANDBOX_ROOT/root/certs/ca.pem" ]; then
-  openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+  if ! ca_error="$(OPENSSL_CONF="$SANDBOX_ROOT/root/certs/openssl.cnf" \
+    openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
     -subj '/CN=Hermes dev sandbox CA' \
+    -extensions sandbox_ca_ext \
     -keyout "$SANDBOX_ROOT/root/certs/ca.key" \
-    -out "$SANDBOX_ROOT/root/certs/ca.pem" >/dev/null 2>&1
+    -out "$SANDBOX_ROOT/root/certs/ca.pem" 2>&1 >/dev/null)"; then
+    echo 'error: could not create the sandbox CA:' >&2
+    printf '%s\n' "$ca_error" >&2
+    exit 1
+  fi
 fi
 GIT_UPLOAD_PACK="$(command -v git-upload-pack)"
-printf '#!%s\nexec %q /work/repos/hermes-agent.git\n' "$SANDBOX_SHELL" "$GIT_UPLOAD_PACK" \
+sed "s|@GIT_UPLOAD_PACK@|$GIT_UPLOAD_PACK|" "$SANDBOX_ASSETS/ssh-shim.sh" \
   > "$SANDBOX_ROOT/root/usr/bin/ssh"
 chmod 700 "$SANDBOX_ROOT/root/usr/bin/ssh"
 
-cat > "$SANDBOX_ROOT/root/proxy.py" <<'PY'
-import pathlib, socket, ssl, subprocess, sys, threading
-from urllib.parse import unquote, urlsplit
+# The fake-internet proxy and the ssh shim are real files under
+# scripts/sandbox/ rather than heredocs, so they can be linted, syntax-checked
+# and diffed like any other source. Copy them into the sandbox tree.
+cp "$SANDBOX_ASSETS/proxy.py" "$SANDBOX_ROOT/root/proxy.py"
 
-ROOT, CERTS, REAL_CA = map(pathlib.Path, sys.argv[1:])
-
-def read_request(conn):
-    data = b""
-    while b"\r\n\r\n" not in data and len(data) < 65536:
-        part = conn.recv(4096)
-        if not part:
-            return b""
-        data += part
-    return data
-
-def cert_for(host):
-    safe = ''.join(char if char.isalnum() or char in '.-' else '_' for char in host)
-    cert, key = CERTS / f'{safe}.pem', CERTS / f'{safe}.key'
-    if not cert.exists():
-        csr = CERTS / f'{safe}.csr'
-        subprocess.run(['openssl', 'req', '-newkey', 'rsa:2048', '-nodes',
-                        '-subj', f'/CN={host}', '-addext', f'subjectAltName=DNS:{host}',
-                        '-keyout', str(key), '-out', str(csr)], check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(['openssl', 'x509', '-req', '-days', '2', '-in', str(csr),
-                        '-CA', str(CERTS / 'ca.pem'), '-CAkey', str(CERTS / 'ca.key'),
-                        '-CAcreateserial', '-copy_extensions', 'copy', '-out', str(cert)],
-                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return cert, key
-
-def file_for(host, target):
-    path = urlsplit(target).path or '/'
-    parts = pathlib.PurePosixPath(unquote(path)).parts
-    if '..' in parts:
-        return None
-    candidate = ROOT / host / pathlib.PurePosixPath(*[part for part in parts if part != '/'])
-    if candidate.is_dir():
-        candidate /= 'index.html'
-    return candidate if candidate.is_file() else None
-
-def respond_fixture(conn, found):
-    body = found.read_bytes()
-    header = b'HTTP/1.1 200 OK\r\n'
-    conn.sendall(header + f'Content-Length: {len(body)}\r\nConnection: close\r\n\r\n'.encode() + body)
-
-def close_request(request, target=None):
-    headers, separator, body = request.partition(b'\r\n\r\n')
-    lines = headers.split(b'\r\n')
-    if target is not None:
-        method, _, version = lines[0].split(b' ', 2)
-        lines[0] = b' '.join((method, target.encode(), version))
-    lines = [line for line in lines if not line.lower().startswith(b'proxy-connection:')]
-    lines.append(b'Connection: close')
-    return b'\r\n'.join(lines) + separator + body
-
-def relay(source, destination):
-    while True:
-        chunk = source.recv(65536)
-        if not chunk:
-            return
-        destination.sendall(chunk)
-
-def forward_https(conn, host, port, request):
-    context = ssl.create_default_context(cafile=str(REAL_CA))
-    with socket.create_connection((host, port), timeout=30) as raw:
-        with context.wrap_socket(raw, server_hostname=host) as upstream:
-            upstream.sendall(close_request(request))
-            relay(upstream, conn)
-
-def forward_http(conn, host, port, request, target):
-    parsed = urlsplit(target)
-    path = parsed.path or '/'
-    if parsed.query:
-        path += f'?{parsed.query}'
-    with socket.create_connection((host, port), timeout=30) as upstream:
-        upstream.sendall(close_request(request, path))
-        relay(upstream, conn)
-
-def handle_request(conn):
-    with conn:
-        request = read_request(conn)
-        if not request:
-            return
-        line = request.split(b'\r\n', 1)[0].decode('iso-8859-1')
-        method, target, _ = line.split(' ', 2)
-        if method.upper() == 'CONNECT':
-            host, _, port_text = target.rpartition(':')
-            port = int(port_text or '443')
-            conn.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
-            cert, key = cert_for(host)
-            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            context.load_cert_chain(cert, key)
-            with context.wrap_socket(conn, server_side=True) as tls:
-                nested = read_request(tls)
-                if nested:
-                    nested_target = nested.split(b'\r\n', 1)[0].decode('iso-8859-1').split(' ', 2)[1]
-                    found = file_for(host, nested_target)
-                    if found is not None:
-                        respond_fixture(tls, found)
-                    else:
-                        forward_https(tls, host, port, nested)
-            return
-        parsed = urlsplit(target)
-        host = parsed.hostname
-        if not host:
-            for header in request.split(b'\r\n')[1:]:
-                if header.lower().startswith(b'host:'):
-                    host = header.split(b':', 1)[1].strip().decode().split(':', 1)[0]
-                    break
-        host = host or 'unknown'
-        found = file_for(host, target)
-        if found is not None:
-            respond_fixture(conn, found)
-        else:
-            forward_http(conn, host, parsed.port or 80, request, target)
-
-def handle(conn):
-    try:
-        handle_request(conn)
-    except Exception as error:
-        print(f'proxy request failed: {error!r}', file=sys.stderr, flush=True)
-
-with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(('127.0.0.1', 8080))
-    server.listen()
-    while True:
-        conn, _ = server.accept()
-        threading.Thread(target=handle, args=(conn,), daemon=True).start()
-PY
-
-if [ "$INSTALL_FROM_MAIN" = true ]; then
-  echo "[sandbox] fake main: real upstream main ($UPSTREAM_COMMIT)" >&2
+if [ -n "$INSTALL_REF" ]; then
+  echo "[sandbox] fake main: upstream $INSTALL_REF ($UPSTREAM_COMMIT)" >&2
   echo "[sandbox] prepared update: current folder ($SOURCE_REF)" >&2
 else
   echo "[sandbox] fake main: current folder ($SOURCE_REF)" >&2
 fi
 echo "[sandbox] root: $SANDBOX_ROOT" >&2
 echo "[sandbox] http root: $SANDBOX_ROOT/root/http" >&2
+if [ "$RUN_AS_USER" = true ]; then
+  echo "[sandbox] identity: $SANDBOX_USER (uid $SANDBOX_UID) — installs are user-level under $SANDBOX_HOME" >&2
+else
+  echo '[sandbox] identity: root (uid 0) — installs use the /usr/local FHS layout' >&2
+fi
 [ "$PERSISTENT" = true ] && echo '[sandbox] persistent' >&2 || echo '[sandbox] ephemeral' >&2
 
-for command in awk bash bwrap curl git nc openssl python3 slirp4netns tar; do
+for command in awk bash bwrap curl git openssl python3 slirp4netns tar unshare; do
   command -v "$command" >/dev/null || {
     echo "error: missing required command: $command" >&2
     exit 1
@@ -620,15 +490,102 @@ if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -n "${WAYLAND_DISPLAY:-}" ] \
   WAYLAND_SOCKET="$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
 fi
 
-exec env \
+# Namespace plan (stage 1 -> stage 2).
+#
+# slirp4netns joins the target's userns and setuids to root before configuring
+# the netns, so the userns MUST map a uid 0. bwrap's own --unshare-user maps
+# exactly one uid, so it cannot both run the payload as uid 1000 and offer slirp
+# a root to become: that combination fails with
+# setns(CLONE_NEWNET): Operation not permitted.
+#
+# So stage 1 builds the namespaces here with two ranges:
+#   inner 0    <- a subuid, unused by the payload, present only so slirp can
+#                become root inside the namespace
+#   inner $SANDBOX_UID <- our real host uid, so everything the sandbox writes
+#                stays owned by us and `rm -rf` on a persistent sandbox needs
+#                no privileges or chown dance
+# The payload then runs in stage 2, where bwrap adds the mount/pid namespaces
+# without creating a userns at all.
+#
+# The root layout needs no subuid at all: inner 0 IS the host uid there.
+netns_args=(--user --net)
+if [ "$RUN_AS_USER" = true ]; then
+  host_user="$(id -un)"
+  subuid_base="$(awk -F: -v u="$host_user" '$1 == u {print $2; exit}' /etc/subuid)"
+  subgid_base="$(awk -F: -v u="$host_user" '$1 == u {print $2; exit}' /etc/subgid)"
+  if [ -z "$subuid_base" ] || [ -z "$subgid_base" ]; then
+    echo "error: no /etc/subuid or /etc/subgid range for $host_user" >&2
+    echo '       A user-level sandbox needs one spare subordinate id to host' >&2
+    echo "       its internal root. Add e.g. '$host_user:100000:65536' to both," >&2
+    echo '       or use --root.' >&2
+    exit 1
+  fi
+  netns_args+=(
+    --map-users="0:$subuid_base:1" --map-users="$SANDBOX_UID:$(id -u):1"
+    --map-groups="0:$subgid_base:1" --map-groups="$SANDBOX_GID:$(id -g):1"
+  )
+else
+  netns_args+=(--map-root-user)
+fi
+
+sandbox_pid_file="$SANDBOX_ROOT/root/logs/sandbox.pid"
+slirp_ready="$SANDBOX_ROOT/root/logs/slirp.ready"
+slirp_log="$SANDBOX_ROOT/root/logs/slirp.log"
+: > "$sandbox_pid_file"
+: > "$slirp_ready"
+
+env \
   DEV_SANDBOX_ROOT="$SANDBOX_ROOT" \
   DEV_SANDBOX_BASH="$(command -v bash)" \
-  DEV_SANDBOX_SLIRP4NETNS="$(command -v slirp4netns)" \
   DEV_SANDBOX_REAL_CA_CERT="$REAL_CA_CERT" \
   DEV_SANDBOX_INTERACTIVE="$INTERACTIVE" \
+  DEV_SANDBOX_USER="$SANDBOX_USER" \
+  DEV_SANDBOX_HOME="$SANDBOX_HOME" \
   DEV_SANDBOX_NODE_DIR="$NODE_DIR" \
   DEV_SANDBOX_ELECTRON_LD_LIBRARY_PATH="${DEV_SANDBOX_ELECTRON_LD_LIBRARY_PATH:-}" \
   DEV_SANDBOX_XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
   DEV_SANDBOX_WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
   DEV_SANDBOX_WAYLAND_SOCKET="$WAYLAND_SOCKET" \
-  "$BASH_SOURCE" --internal-run "$@"
+  unshare "${netns_args[@]}" \
+    "$SANDBOX_ASSETS/stage2-run.sh" "$@" &
+sandbox_launcher=$!
+
+for _ in $(seq 1 200); do
+  [ -s "$sandbox_pid_file" ] && break
+  if ! kill -0 "$sandbox_launcher" 2>/dev/null; then
+    wait "$sandbox_launcher"
+    exit $?
+  fi
+  sleep 0.05
+done
+sandbox_pid="$(tr -dc '0-9' < "$sandbox_pid_file")"
+if [ -z "$sandbox_pid" ]; then
+  echo 'error: sandbox did not report its PID' >&2
+  exit 1
+fi
+
+slirp4netns --configure --disable-host-loopback --ready-fd=3 \
+  --userns-path="/proc/$sandbox_pid/ns/user" "$sandbox_pid" tap0 \
+  3>"$slirp_ready" >"$slirp_log" 2>&1 &
+slirp_pid=$!
+cleanup_slirp() {
+  kill "$slirp_pid" 2>/dev/null || true
+  wait "$slirp_pid" 2>/dev/null || true
+}
+trap cleanup_slirp EXIT INT TERM
+
+for _ in $(seq 1 200); do
+  [ -s "$slirp_ready" ] && break
+  if ! kill -0 "$slirp_pid" 2>/dev/null; then
+    cat "$slirp_log" >&2 || true
+    exit 1
+  fi
+  sleep 0.05
+done
+if [ ! -s "$slirp_ready" ]; then
+  echo 'error: timed out waiting for sandbox network setup' >&2
+  exit 1
+fi
+
+wait "$sandbox_launcher"
+exit $?
