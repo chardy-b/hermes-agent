@@ -21,6 +21,23 @@ metadata:
 
 Gmail, Calendar, Drive, Contacts, Sheets, and Docs — through Hermes-managed OAuth and a thin CLI wrapper. When `gws` is installed, the skill uses it as the execution backend for broader Google Workspace coverage; otherwise it falls back to the bundled Python client implementation.
 
+### Keyholder access (recommended for managed runs)
+
+When Keyholder is available, default to a purpose-named grant and let it inject
+an access token:
+
+```bash
+keyholder run <purpose-named-grant> --env GOOGLE_WORKSPACE_CLI_TOKEN -- \
+  "$GAPI" gmail search "is:unread"
+```
+
+The injected `GOOGLE_WORKSPACE_CLI_TOKEN` takes precedence for both the `gws`
+and Python client paths. In this mode the scripts do not read, write, or
+refresh `google_token.json`. Do not show or access long-lived OAuth
+credentials, and do not issue direct output tokens; direct output token
+issuance is discouraged. Existing confirmation rules for email, Calendar,
+Drive, Docs, and Sheets mutations remain mandatory even when Keyholder is used.
+
 ## References
 
 - `references/gmail-search-syntax.md` — Gmail search operators (is:unread, from:, newer_than:, etc.)

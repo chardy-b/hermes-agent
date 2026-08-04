@@ -93,15 +93,25 @@ def get_valid_token() -> str:
     return token_data["token"]
 
 
+def get_injected_token() -> str | None:
+    """Return a Keyholder-injected token, if one is present."""
+    token = os.environ.get("GOOGLE_WORKSPACE_CLI_TOKEN", "")
+    return token or None
+
+
 def main():
     """Refresh token if needed, then exec gws with remaining args."""
     if len(sys.argv) < 2:
         print("Usage: gws_bridge.py <gws args...>", file=sys.stderr)
         sys.exit(1)
 
-    access_token = get_valid_token()
+    # Keyholder owns the lifetime of this short-lived token. In this mode do
+    # not even inspect the file-backed OAuth credentials.
+    access_token = get_injected_token() or get_valid_token()
     env = os.environ.copy()
     env["GOOGLE_WORKSPACE_CLI_TOKEN"] = access_token
+    if get_injected_token():
+        env.pop("GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE", None)
 
     result = subprocess.run(["gws"] + sys.argv[1:], env=env)
     sys.exit(result.returncode)

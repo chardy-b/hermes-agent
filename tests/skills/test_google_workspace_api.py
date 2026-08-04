@@ -175,6 +175,19 @@ def test_bridge_main_injects_token_env(bridge_module, tmp_path):
     assert captured["cmd"] == ["gws", "gmail", "+triage"]
 
 
+def test_bridge_injected_token_does_not_read_token_file(bridge_module, monkeypatch):
+    monkeypatch.setenv("GOOGLE_WORKSPACE_CLI_TOKEN", "ya29.keyholder")
+    with patch.object(bridge_module, "get_token_path", side_effect=AssertionError("file accessed")):
+        assert bridge_module.get_injected_token() == "ya29.keyholder"
+
+        captured = {}
+        with patch.object(sys, "argv", ["gws_bridge.py", "gmail", "+triage"]):
+            with patch.object(subprocess, "run", side_effect=lambda cmd, **kwargs: captured.update(cmd=cmd, env=kwargs["env"]) or MagicMock(returncode=0)):
+                with pytest.raises(SystemExit):
+                    bridge_module.main()
+    assert captured["env"]["GOOGLE_WORKSPACE_CLI_TOKEN"] == "ya29.keyholder"
+
+
 def test_api_calendar_list_uses_events_list(api_module):
     """calendar_list calls _run_gws with events list + params."""
     captured = {}
@@ -201,6 +214,32 @@ def test_api_calendar_list_uses_events_list(api_module):
     assert "timeMin" in params
     assert "timeMax" in params
     assert params["calendarId"] == "primary"
+
+
+def test_api_gws_injected_token_skips_auth_file(api_module, monkeypatch):
+    monkeypatch.setenv("GOOGLE_WORKSPACE_CLI_TOKEN", "ya29.keyholder")
+    monkeypatch.setenv("GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE", "/must-not-be-used")
+    with patch.object(api_module, "_ensure_authenticated", side_effect=AssertionError("auth file accessed")):
+        env = api_module._gws_env()
+        assert env["GOOGLE_WORKSPACE_CLI_TOKEN"] == "ya29.keyholder"
+        assert "GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE" not in env
+        with patch.object(api_module.subprocess, "run", return_value=MagicMock(returncode=0, stdout="{}", stderr="")):
+            assert api_module._run_gws(["calendar", "calendarList", "list"]) == {}
+
+
+def test_api_python_credentials_use_injected_access_token(api_module, monkeypatch):
+    monkeypatch.setenv("GOOGLE_WORKSPACE_CLI_TOKEN", "ya29.keyholder")
+
+    class FakeCredentials:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    credentials_module = types.ModuleType("google.oauth2.credentials")
+    credentials_module.Credentials = FakeCredentials
+    with patch.dict(sys.modules, {"google.oauth2.credentials": credentials_module}), \
+         patch.object(api_module, "_ensure_authenticated", side_effect=AssertionError("auth file accessed")):
+        creds = api_module.get_credentials()
+    assert creds.kwargs == {"token": "ya29.keyholder"}
 
 
 def test_api_calendar_list_respects_date_range(api_module):

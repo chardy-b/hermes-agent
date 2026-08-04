@@ -68,6 +68,12 @@ def _ensure_authenticated():
         sys.exit(1)
 
 
+def _injected_token() -> str | None:
+    """Return the short-lived token supplied by Keyholder, when present."""
+    token = os.environ.get("GOOGLE_WORKSPACE_CLI_TOKEN", "")
+    return token or None
+
+
 def _stored_token_scopes() -> list[str]:
     try:
         data = json.loads(TOKEN_PATH.read_text())
@@ -88,7 +94,10 @@ def _gws_binary() -> str | None:
 
 def _gws_env() -> dict[str, str]:
     env = os.environ.copy()
-    env["GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE"] = str(TOKEN_PATH)
+    if _injected_token():
+        env.pop("GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE", None)
+    else:
+        env["GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE"] = str(TOKEN_PATH)
     return env
 
 
@@ -97,7 +106,8 @@ def _run_gws(parts: list[str], *, params: dict | None = None, body: dict | None 
     if not binary:
         raise RuntimeError("gws not installed")
 
-    _ensure_authenticated()
+    if not _injected_token():
+        _ensure_authenticated()
 
     cmd = [binary, *parts]
     if params is not None:
@@ -180,9 +190,13 @@ def _datetime_with_timezone(value: str) -> str:
 
 def get_credentials():
     """Load and refresh credentials from token file."""
-    _ensure_authenticated()
-
     from google.oauth2.credentials import Credentials
+
+    injected_token = _injected_token()
+    if injected_token:
+        return Credentials(token=injected_token)
+
+    _ensure_authenticated()
     from google.auth.transport.requests import Request
 
     creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), _stored_token_scopes())
