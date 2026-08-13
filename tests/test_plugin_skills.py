@@ -423,3 +423,84 @@ class TestBundleContextBanner:
         self._setup_bundle(tmp_path)
         result = json.loads(skill_view("myplugin:foo"))
         assert "foo body." in result["content"]
+
+class TestPluginProgressiveSkillView:
+    @pytest.fixture(autouse=True)
+    def _isolate(self, tmp_path, monkeypatch):
+        from hermes_cli import plugins as plugins_mod
+        from hermes_cli.plugins import PluginManager
+
+        self.pm = PluginManager()
+        monkeypatch.setattr(plugins_mod, "_plugin_manager", self.pm)
+        empty = tmp_path / "empty-plugin-progressive"
+        empty.mkdir()
+        monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", empty)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+
+    def _register(self, tmp_path, qualified, content):
+        plugin, name = qualified.split(":", 1)
+        directory = tmp_path / "plugins" / plugin / "skills" / name
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "SKILL.md"
+        path.write_text(content)
+        self.pm._plugin_skills[qualified] = {
+            "path": path,
+            "plugin": plugin,
+            "bare_name": name,
+            "description": "",
+        }
+        return directory
+
+    def test_plugin_projection_excludes_bundle_banner_and_filters_links(self, tmp_path):
+        from tools.skills_tool import skill_view
+
+        directory = self._register(
+            tmp_path,
+            "plug:root",
+            "---\nname: root\ndescription: root\n---\n\n"
+            "## Deploy\nUse [guide](references/deploy.md).\n\n"
+            "## Other\nOther plugin body.\n",
+        )
+        references = directory / "references"
+        references.mkdir()
+        (references / "deploy.md").write_text("deploy")
+        self._register(
+            tmp_path,
+            "plug:sibling",
+            "---\nname: sibling\n---\nSibling.\n",
+        )
+
+        legacy = json.loads(skill_view("plug:root"))
+        projected = json.loads(skill_view("plug:root", heading="Deploy", max_chars=256))
+        assert "Bundle context" in legacy["content"]
+        assert "Bundle context" not in projected["content"]
+        assert "Other plugin body" not in projected["content"]
+        assert list(projected["linked_files"]) == ["references/deploy.md"]
+        assert projected["projection"]["match_type"] == "exact"
+        assert projected["full_content_chars"] == projected["projection"]["total_chars"]
+        assert projected["full_content_chars"] > len(projected["content"])
+
+    def test_plugin_router_defaults_to_metadata_inventory_and_cross_plugin_child(self, tmp_path):
+        from tools.skills_tool import skill_view
+
+        self._register(
+            tmp_path,
+            "plug:router",
+            "---\nname: router\nmetadata:\n  hermes:\n    composition:\n"
+            "      type: router\n      invariants:\n        verification: [tests=required]\n"
+            "      children:\n        - id: child\n          skill: other:child\n"
+            "          trigger: Run child procedure\n---\n\n# Router\nROUTER BODY\n",
+        )
+        self._register(
+            tmp_path,
+            "other:child",
+            "---\nname: child\nmetadata:\n  hermes:\n    composition:\n"
+            "      type: procedure\n---\n\n# Child\nSECRET CHILD BODY\n",
+        )
+
+        result = json.loads(skill_view("plug:router"))
+        assert result["success"] is True
+        assert result["content"] == "- child: Run child procedure"
+        assert "SECRET CHILD BODY" not in result["content"]
+        assert result["composition_invariants"]["verification"] == ["tests=required"]
+        assert result["composition"]["available_children"][0]["estimated_chars"] > 0
