@@ -2,7 +2,11 @@ import hashlib
 
 import pytest
 
-from agent.skill_composition import select_skill_content
+from agent.skill_composition import (
+    parse_composition_metadata,
+    select_skill_content,
+    validate_skill_composition,
+)
 
 
 DOC = """# Skill\n\n## Prerequisites\nInstall tools.\n\n## Deploy\nDeploy the app safely.\nSee [deploy.md](references/deploy.md).\n\n### Rollback\nRollback steps.\n\n## Warnings\nNever expose secrets.\n\n## Other\nOther details.\n"""
@@ -136,3 +140,204 @@ def test_linked_files_support_flat_metadata_and_exact_mentions_only():
     r = select_skill_content(doc, heading="Use", linked_files=linked)
     assert list(r["linked_files"]) == ["refs/a.md", "refs/b.md", "refs/c.md"]
     assert "refs/ab.md" not in r["linked_files"]
+
+def _composition(kind="flat", **values):
+    return {"metadata": {"hermes": {"composition": {"type": kind, **values}}}}
+
+
+def _router(children, **values):
+    return _composition("router", children=children, **values)
+
+
+def test_composition_metadata_canonical_precedence_and_flat_compatibility():
+    frontmatter = {
+        "composition": {"type": "procedure", "trigger": "legacy"},
+        "metadata": {
+            "hermes": {
+                "composition": {
+                    "type": "router",
+                    "stable_id": "android.qa",
+                    "trigger": "Route Android QA operations",
+                    "children": [],
+                }
+            }
+        },
+    }
+    parsed = parse_composition_metadata(frontmatter)
+    assert parsed["type"] == "router"
+    assert parsed["stable_id"] == "android.qa"
+    assert parsed["diagnostics"] == ["composition_alias_ignored"]
+    assert parse_composition_metadata({})["type"] == "flat"
+
+
+def test_router_selects_only_requested_children_in_declaration_order():
+    graph = {
+        "root": _router(
+            [
+                {"id": "ci", "skill": "android-ci", "trigger": "CI failures"},
+                {"id": "location", "skill": "android-location", "trigger": "Location simulation"},
+                {"id": "visual", "skill": "android-visual", "trigger": "Visual evidence"},
+            ],
+            invariants={"safety": ["secrets=redact"]},
+        ),
+        "android-ci": _composition("procedure", content_chars=1200),
+        "android-location": _composition("procedure", content_chars=900),
+        "android-visual": _composition("procedure", content_chars=800),
+    }
+    result = validate_skill_composition(
+        "root",
+        load_metadata=graph.get,
+        selected_children=["visual", "ci", "visual"],
+    )
+    assert result["success"] is True
+    assert [child["id"] for child in result["selected_children"]] == ["ci", "visual"]
+    assert [child["id"] for child in result["available_children"]] == ["ci", "location", "visual"]
+    assert result["available_children"][0]["estimated_chars"] == 1200
+    assert result["cost"] == {
+        "root_chars": 0,
+        "selected_child_chars": 2000,
+        "direct_child_chars": 2900,
+        "validated_graph_chars": 2900,
+        "validated_nodes": 4,
+        "max_validated_nodes": 256,
+    }
+    assert result["selected_children"][0]["inherited_invariants"]["safety"] == ["secrets=redact"]
+
+
+def test_composition_inherits_plain_and_keyed_invariants_and_allows_same_override():
+    graph = {
+        "root": _router(
+            [{"id": "child", "skill": "child", "trigger": "Use child"}],
+            invariants={
+                "safety": ["secrets=redact", "Do not expose tokens"],
+                "verification": ["tests=required"],
+            },
+        ),
+        "child": _composition(
+            "procedure",
+            invariants={"verification": ["Capture evidence"]},
+            invariant_overrides={"safety": ["secrets=redact"]},
+        ),
+    }
+    result = validate_skill_composition(
+        "root", load_metadata=graph.get, selected_children=["child"]
+    )
+    inherited = result["selected_children"][0]["inherited_invariants"]
+    assert inherited["safety"] == ["secrets=redact", "Do not expose tokens"]
+    assert inherited["verification"] == ["tests=required", "Capture evidence"]
+
+
+def test_composition_rejects_conflicting_invariants():
+    graph = {
+        "root": _router(
+            [{"id": "child", "skill": "child", "trigger": "Use child"}],
+            invariants={"safety": ["secrets=redact"]},
+        ),
+        "child": _composition(
+            "procedure", invariant_overrides={"safety": ["secrets=show"]}
+        ),
+    }
+    result = validate_skill_composition("root", load_metadata=graph.get)
+    assert result["error_code"] == "composition_invariant_conflict"
+    assert result["category"] == "safety"
+    assert result["key"] == "secrets"
+    assert result["chain"] == ["root", "child"]
+
+
+def test_composition_reports_missing_undeclared_cycle_and_depth_errors():
+    missing = {
+        "root": _router([{"id": "gone", "skill": "gone", "trigger": "Missing"}])
+    }
+    assert validate_skill_composition("root", load_metadata=missing.get)["error_code"] == "composition_missing_child"
+
+    valid = {
+        "root": _router([{"id": "child", "skill": "child", "trigger": "Child"}]),
+        "child": _composition("procedure"),
+    }
+    assert validate_skill_composition(
+        "root", load_metadata=valid.get, selected_children=["other"]
+    )["error_code"] == "composition_child_not_declared"
+
+    cycle = {
+        "a": _router([{"id": "b", "skill": "b", "trigger": "B"}]),
+        "b": _router([{"id": "a", "skill": "a", "trigger": "A"}]),
+    }
+    assert validate_skill_composition("a", load_metadata=cycle.get)["error_code"] == "composition_cycle"
+
+    deep = {
+        "a": _router([{"id": "b", "skill": "b", "trigger": "B"}]),
+        "b": _router([{"id": "c", "skill": "c", "trigger": "C"}]),
+        "c": _composition("procedure"),
+    }
+    assert validate_skill_composition(
+        "a", load_metadata=deep.get, max_depth=1
+    )["error_code"] == "composition_depth_exceeded"
+
+
+def test_shared_child_dag_does_not_overwrite_root_child_inheritance():
+    graph = {
+        "root": _router(
+            [
+                {"id": "shared", "skill": "shared", "trigger": "Direct shared"},
+                {"id": "branch", "skill": "branch", "trigger": "Branch"},
+            ],
+            invariants={"safety": ["root=on"]},
+        ),
+        "branch": _router(
+            [{"id": "nested", "skill": "shared", "trigger": "Nested shared"}],
+            invariants={"environment": ["branch=on"]},
+        ),
+        "shared": _composition("procedure"),
+    }
+    result = validate_skill_composition(
+        "root", load_metadata=graph.get, selected_children=["shared"]
+    )
+    inherited = result["selected_children"][0]["inherited_invariants"]
+    assert inherited["safety"] == ["root=on"]
+    assert inherited["environment"] == []
+
+
+def test_composition_metadata_rejects_malicious_or_unbounded_values():
+    invalid = [
+        {"metadata": "bad"},
+        _composition("router", stable_id="../../bad", children=[]),
+        _composition("router", trigger="x" * 241, children=[]),
+        _router([{"id": "bad id", "skill": "child", "trigger": "Child"}]),
+        _router([{"id": "same", "skill": "a", "trigger": "A"}, {"id": "same", "skill": "b", "trigger": "B"}]),
+        _composition("procedure", children=[{"id": "x", "skill": "x", "trigger": "X"}]),
+        _composition("router", max_depth=True, children=[]),
+        _composition("procedure", content_chars=2_000_001),
+        _composition("router", invariants={"unknown": ["x"]}, children=[]),
+    ]
+    for frontmatter in invalid:
+        assert parse_composition_metadata(frontmatter)["error_code"] == "composition_invalid_metadata"
+
+
+def test_composition_validation_visit_limit_is_bounded(monkeypatch):
+    monkeypatch.setattr("agent.skill_composition.MAX_COMPOSITION_VISITS", 3)
+    graph = {
+        "root": _router(
+            [
+                {"id": "a", "skill": "a", "trigger": "A"},
+                {"id": "b", "skill": "b", "trigger": "B"},
+                {"id": "c", "skill": "c", "trigger": "C"},
+            ]
+        ),
+        "a": _composition("procedure"),
+        "b": _composition("procedure"),
+        "c": _composition("procedure"),
+    }
+    result = validate_skill_composition("root", load_metadata=graph.get)
+    assert result["error_code"] == "composition_depth_exceeded"
+    assert result["reason"] == "composition_visit_limit"
+    assert result["limit"] == 3
+
+
+def test_duplicate_identical_children_are_collapsed_and_bool_depth_rejected():
+    child = {"id": "same", "skill": "child", "trigger": "Child"}
+    parsed = parse_composition_metadata(_router([child, dict(child)]))
+    assert parsed["children"] == [child]
+    graph = {"root": _router([])}
+    assert validate_skill_composition(
+        "root", load_metadata=graph.get, max_depth=True
+    )["error_code"] == "composition_depth_exceeded"
