@@ -59,6 +59,8 @@ def backtest_report(current: dict[str, Any], baseline: Any) -> dict[str, Any]:
         out["compatible"] = False; out["errors"] = ["report must be a JSON object"]; return out
     def validate(report, label):
         errors, warnings = [], []
+        if "stats" in report and not isinstance(report.get("stats"), dict):
+            errors.append(f"{label}.stats must be an object")
         for key in ("skills", "edges"):
             if not isinstance(report.get(key), list):
                 errors.append(f"{label}.{key} must be a list")

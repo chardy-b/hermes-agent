@@ -99,6 +99,18 @@ def test_backtest_validates_schema_and_reports_semantic_status_changes(monkeypat
     assert any("target must be a nonempty string" in error for error in malformed["baseline_errors"])
 
 
+@pytest.mark.parametrize("side", ["baseline", "current"])
+def test_backtest_rejects_non_object_stats_without_crashing(side):
+    valid = {"skills": [], "edges": [], "duplicates": [], "stats": {}}
+    malformed = {**valid, "stats": "bad"}
+    current = malformed if side == "current" else valid
+    baseline = malformed if side == "baseline" else valid
+    result = backtest_report(current, baseline)
+    assert result["compatible"] is False
+    errors = result["errors"] if side == "current" else result["baseline_errors"]
+    assert errors == [f"{side}.stats must be an object"]
+
+
 def test_backtest_bounds_deltas_and_exposes_total_counts(monkeypatch):
     monkeypatch.setattr(skill_reviewer, "_MAX_BACKTEST_ITEMS", 2)
     baseline = {"skills": [], "edges": [], "duplicates": []}
