@@ -70,6 +70,8 @@ import json
 import logging
 import time
 import threading
+import hashlib
+import copy
 
 from hermes_constants import get_hermes_home, display_hermes_home
 import os
@@ -1190,6 +1192,7 @@ def _apply_composition(result, name, children, *, max_chars=8000):
         )
         return result
     if validation.get("type") == "router":
+        result.setdefault("full_content_chars", len(result.get("content", "")))
         result["composition_invariants"] = validation.get(
             "inherited_invariants", {}
         )
@@ -2103,106 +2106,124 @@ registry.register(
 # conversation already carries it verbatim. Cleared on context compression
 # via reset_skill_view_dedup() (wired next to read_file's reset_file_dedup)
 # because after compression the original content is summarized away.
-_skill_view_tracker: Dict[str, Dict[tuple, tuple]] = {}
+_skill_view_tracker: Dict[str, Dict[str, dict]] = {}
+_skill_view_scope_tasks: Dict[str, set[str]] = {}
 _skill_view_tracker_lock = threading.Lock()
 _SKILL_VIEW_DEDUP_CAP = 200
-
+_SKILL_VIEW_SCOPE_ALIAS_CAP = 200
 _SKILL_VIEW_DEDUP_MESSAGE = (
-    "Skill content unchanged since it was loaded earlier in this "
-    "conversation — refer to the earlier skill_view result; it is still "
-    "current and complete. (Re-issued after context compression, this "
-    "returns the full content again.)"
+    "Skill content unchanged since it was loaded earlier in this conversation — "
+    "refer to the earlier skill_view result; it is still current and complete."
 )
 
 
-def _skill_view_fingerprint(payload: dict) -> tuple | None:
-    """Stat the skill file a successful skill_view served, for change detection."""
-    src = payload.get("_source_path")
-    if not src:
-        return None
-    try:
-        st = os.stat(src)
-        return (src, st.st_mtime_ns, st.st_size)
-    except OSError:
-        return None
+def _skill_view_identity(args, payload):
+    name = str(payload.get("name") or args.get("name") or "")
+    source_path = payload.get("_source_path")
+    source_identity = (
+        hashlib.sha256(
+            os.path.realpath(str(source_path)).encode("utf-8")
+        ).hexdigest()
+        if source_path
+        else None
+    )
+    max_chars = args.get("max_chars")
+    progressive = bool(payload.get("projection")) or any(
+        key in args for key in ("heading", "query", "max_chars", "children")
+    )
+    if progressive and max_chars is None:
+        max_chars = 8000
+    children = args.get("children", "__omitted__")
+    if children != "__omitted__":
+        children = None if children is None else sorted(set(children))
+    retrieval = {
+        "name": name,
+        "source_identity": source_identity,
+        "file_path": args.get("file_path"),
+                 "heading": args.get("heading"), "query": args.get("query"),
+                 "max_chars": max_chars, "children": children}
+    rid = hashlib.sha256(json.dumps(retrieval, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    visible = copy.deepcopy(payload)
+    visible.pop("_source_path", None)
+    visible.pop("content_hash", None)
+    visible.pop("retrieval_id", None)
+    chash = hashlib.sha256(json.dumps(visible, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    return rid, chash, retrieval
 
 
-def _record_skill_view(task_id, name, file_path, payload: dict) -> None:
-    """Record a served skill_view so an identical repeat can be deduped."""
-    if not task_id:
+def _skill_view_scope(task_id, session_id):
+    return "session:" + str(session_id) if session_id else ("task:" + str(task_id) if task_id else None)
+
+
+def _associate_skill_view_scope(task_id, scope):
+    if not task_id or not scope:
         return
-    # Never dedup setup-needed views: readiness depends on config/env state
-    # that can change without the skill file changing, and the model must
-    # see the refreshed setup status on a re-view.
-    if payload.get("setup_needed") or payload.get("readiness_status") == "setup_needed":
-        return
-    fp = _skill_view_fingerprint(payload)
-    if fp is None:
-        return
-    key = (str(payload.get("name") or name), file_path or "")
+    task_key = str(task_id)
+    scopes = _skill_view_scope_tasks.setdefault(task_key, set())
+    scopes.add(scope)
+    while len(_skill_view_scope_tasks) > _SKILL_VIEW_SCOPE_ALIAS_CAP:
+        oldest_task = next(iter(_skill_view_scope_tasks))
+        if oldest_task == task_key and len(_skill_view_scope_tasks) == 1:
+            break
+        evicted_scopes = _skill_view_scope_tasks.pop(oldest_task, set())
+        for evicted_scope in evicted_scopes:
+            _skill_view_tracker.pop(evicted_scope, None)
+            for aliases in _skill_view_scope_tasks.values():
+                aliases.discard(evicted_scope)
+
+
+def reset_skill_view_dedup(task_id: str | None = None) -> None:
     with _skill_view_tracker_lock:
-        cache = _skill_view_tracker.setdefault(str(task_id), {})
-        cache[key] = fp
-        while len(cache) > _SKILL_VIEW_DEDUP_CAP:
-            try:
-                cache.pop(next(iter(cache)))
-            except (StopIteration, KeyError):
-                break
+        if task_id is None:
+            _skill_view_tracker.clear(); _skill_view_scope_tasks.clear()
+        else:
+            task_key = str(task_id)
+            scopes = _skill_view_scope_tasks.pop(task_key, set()) | {
+                "task:" + task_key
+            }
+            for scope in scopes:
+                _skill_view_tracker.pop(scope, None)
+            for aliases in _skill_view_scope_tasks.values():
+                aliases.difference_update(scopes)
 
 
-def _check_skill_view_dedup(task_id, name, file_path) -> str | None:
-    """Return a dedup stub when this exact skill file was already served
-    to this task and is unchanged on disk; None otherwise."""
-    if not task_id:
+def _skill_view_check_or_record(
+    scope,
+    task_id,
+    retrieval_id,
+    content_hash,
+    payload,
+    retrieval,
+):
+    if not scope:
         return None
     with _skill_view_tracker_lock:
-        cache = _skill_view_tracker.get(str(task_id))
-        if not cache:
-            return None
-        # The record key uses the RESOLVED name; check both the raw arg and
-        # resolved forms so 'category/skill' and bare-name views coalesce.
-        for key, (src, mtime_ns, size) in list(cache.items()):
-            rec_name, rec_fp = key
-            if rec_fp != (file_path or ""):
-                continue
-            if rec_name != str(name) and not str(name).endswith("/" + rec_name) \
-                    and not rec_name.endswith("/" + str(name)) \
-                    and str(name).split(":")[-1] != rec_name:
-                continue
-            try:
-                st = os.stat(src)
-                if (st.st_mtime_ns, st.st_size) != (mtime_ns, size):
-                    cache.pop(key, None)
-                    return None
-            except OSError:
-                cache.pop(key, None)
-                return None
+        _associate_skill_view_scope(task_id, scope)
+        cache = _skill_view_tracker.setdefault(scope, {})
+        prior = cache.get(retrieval_id)
+        if prior and prior["content_hash"] == content_hash:
             return json.dumps(
                 {
                     "success": True,
                     "status": "unchanged",
-                    "name": rec_name,
-                    "file": file_path or "SKILL.md",
+                    "name": payload.get("name"),
+                    "file": payload.get("file", "SKILL.md"),
                     "dedup": True,
                     "content_returned": False,
+                    "content_hash": content_hash,
+                    "retrieval_id": retrieval_id,
+                    "projection_identity": retrieval,
                     "message": _SKILL_VIEW_DEDUP_MESSAGE,
                 },
                 ensure_ascii=False,
             )
+        cache[retrieval_id] = {
+            "content_hash": content_hash,
+            "retrieval": retrieval,
+        }
+        while len(cache) > _SKILL_VIEW_DEDUP_CAP:
+            cache.pop(next(iter(cache)))
     return None
-
-
-def reset_skill_view_dedup(task_id: str | None = None) -> None:
-    """Clear the skill_view dedup cache (all tasks when task_id is None).
-
-    Called on context compression: the original skill content is
-    summarized away, so a re-view must return full content again.
-    """
-    with _skill_view_tracker_lock:
-        if task_id is None:
-            _skill_view_tracker.clear()
-        else:
-            _skill_view_tracker.pop(str(task_id), None)
 
 
 def _skill_view_with_bump(args, **kw):
@@ -2220,14 +2241,6 @@ def _skill_view_with_bump(args, **kw):
     # "skills must be loaded fully" rule is preserved — and the cache is
     # cleared on context compression (same hook as read_file's dedup)
     # so a post-compression re-view returns full content again.
-    progressive = any(
-        key in args for key in ("heading", "query", "max_chars", "children")
-    )
-    stub = None
-    if not progressive:
-        stub = _check_skill_view_dedup(task_id, name, args.get("file_path"))
-    if stub is not None:
-        return stub
     result = skill_view(
         name, file_path=args.get("file_path"), task_id=task_id,
         heading=args.get("heading"), query=args.get("query"),
@@ -2235,25 +2248,59 @@ def _skill_view_with_bump(args, **kw):
     )
     try:
         parsed = json.loads(result)
-        if isinstance(parsed, dict) and parsed.get("success"):
-            _record_skill_view(task_id, name, args.get("file_path"), parsed)
-            # Use the resolved skill name from the payload when present —
-            # qualified forms ("plugin:skill") return with the canonical name.
-            resolved = parsed.get("name") or name
-            if resolved:
-                from tools.skill_usage import bump_use, bump_view
-                bump_view(str(resolved))
-                # A skill_view tool call is the agent actively loading the skill
-                # to act on it — that counts as use, not just a browse/view.
-                # Curator's stale timer keys off last_used_at (see agent/curator.py).
-                bump_use(
-                    str(resolved),
-                    task_id=kw.get("task_id"),
-                    session_id=kw.get("session_id"),
-                )
-    except Exception:
-        pass
-    return result
+    except (TypeError, ValueError):
+        return result
+    if not isinstance(parsed, dict) or not parsed.get("success"):
+        return result
+
+    try:
+        retrieval_id, content_hash, retrieval = _skill_view_identity(args, parsed)
+    except Exception as exc:
+        logger.warning("Could not compute skill_view content identity", exc_info=True)
+        return json.dumps(
+            {
+                "success": False,
+                "error_code": "skill_view_identity_failed",
+                "error": "Could not compute a safe skill content identity",
+                "name": parsed.get("name") or name,
+            },
+            ensure_ascii=False,
+        )
+
+    parsed["retrieval_id"] = retrieval_id
+    parsed["content_hash"] = content_hash
+    parsed.pop("_source_path", None)
+    setup_needed = parsed.get("setup_needed") or (
+        parsed.get("readiness_status") == "setup_needed"
+    )
+    if setup_needed:
+        return json.dumps(parsed, ensure_ascii=False)
+
+    scope = _skill_view_scope(task_id, kw.get("session_id"))
+    stub = _skill_view_check_or_record(
+        scope,
+        task_id,
+        retrieval_id,
+        content_hash,
+        parsed,
+        retrieval,
+    )
+    if stub is not None:
+        return stub
+    resolved = parsed.get("name") or name
+    if resolved:
+        try:
+            from tools.skill_usage import bump_use, bump_view
+
+            bump_view(str(resolved))
+            bump_use(
+                str(resolved),
+                task_id=task_id,
+                session_id=kw.get("session_id"),
+            )
+        except Exception:
+            logger.debug("Could not record skill usage", exc_info=True)
+    return json.dumps(parsed, ensure_ascii=False)
 
 
 registry.register(
