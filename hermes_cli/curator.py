@@ -10,6 +10,7 @@ the argparse subparsers on demand.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -207,6 +208,36 @@ def _cmd_status(args) -> int:
                     f"last_activity={last}"
                 )
 
+    return 0
+
+
+def _cmd_review(args) -> int:
+    from agent.skill_reviewer import review_skills
+    from agent.skill_utils import get_all_skills_dirs
+    report = review_skills(get_all_skills_dirs(), max_skills=args.max_skills)
+    backtest = None
+    baseline_path = getattr(args, "baseline", None)
+    if baseline_path:
+        from agent.skill_reviewer import backtest_report, load_baseline
+        baseline, error = load_baseline(Path(baseline_path))
+        backtest = {"changed": False, "compatible": False, "errors": [error or "incompatible baseline"], "warnings": [], "counts": {}}
+        if error is None: backtest = backtest_report(report, baseline)
+    if args.json:
+        if backtest is not None: report = {**report, "backtest": backtest}
+        print(json.dumps(report, sort_keys=True, separators=(",", ":")))
+    else:
+        s = report["stats"]
+        print(f"skills: {s['skills']} edges: {s['edges']} candidates: {s['shortening_candidates']} duplicates: {s['duplicates']} truncated: {s['truncated']}")
+        for duplicate in report["duplicates"][:10]:
+            print(f"  duplicate: {duplicate['name']} discarded={duplicate['discarded']} selected={duplicate['selected']}")
+        for row in sorted(report["skills"], key=lambda r: (-r["activity_count"], r["name"]))[:5]:
+            if row["activity_count"]:
+                print(f"  frequent: {row['name']} activity={row['activity_count']}")
+        for row in report["skills"]:
+            if row["shortening_candidate"]:
+                print(f"  candidate: {row['name']}")
+        if backtest is not None:
+            print(f"backtest: changed={backtest['changed']} compatible={backtest['compatible']} deltas={sum(backtest.get('counts', {}).values())}")
     return 0
 
 
@@ -688,6 +719,11 @@ def register_cli(parent: argparse.ArgumentParser) -> None:
 
     p_status = subs.add_parser("status", help="Show curator status and skill stats")
     p_status.set_defaults(func=_cmd_status)
+    p_review = subs.add_parser("review", help="Read-only deterministic skill audit; create a baseline with --json > baseline.json, then compare with --baseline baseline.json")
+    p_review.add_argument("--json", action="store_true")
+    p_review.add_argument("--max-skills", type=int, default=5000)
+    p_review.add_argument("--baseline", metavar="PATH", help="compare with a prior local JSON report")
+    p_review.set_defaults(func=_cmd_review)
 
     p_usage = subs.add_parser(
         "usage",
