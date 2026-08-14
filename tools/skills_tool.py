@@ -876,6 +876,7 @@ def _serve_plugin_skill(
     query: str | None = None,
     max_chars: int | None = None,
     children: list[str] | None = None,
+    force_full: bool = False,
 ) -> str:
     """Read a plugin-provided skill, apply guards, return JSON."""
     from hermes_cli.plugins import _get_disabled_plugins, get_plugin_manager
@@ -1053,7 +1054,7 @@ def _serve_plugin_skill(
         result["projection"] = projected
         result["full_content_chars"] = full_content_chars
     composition_type = _composition_type(parsed_frontmatter)
-    if (
+    if not force_full and (
         children is not None
         or composition_type == "router"
         or (composition_type == "invalid" and _has_composition_metadata(parsed_frontmatter))
@@ -1226,6 +1227,7 @@ def skill_view(
     query: str | None = None,
     max_chars: int | None = None,
     children: list[str] | None = None,
+    force_full: bool = False,
 ) -> str:
     """
     View the content of a skill or a specific file within a skill directory.
@@ -1317,6 +1319,7 @@ def skill_view(
                     query=query,
                     max_chars=max_chars,
                     children=children,
+                    force_full=force_full,
                 )
 
             # Plugin exists but this specific skill is missing?
@@ -1984,7 +1987,7 @@ def skill_view(
             result["metadata"] = metadata
 
         composition_type = _composition_type(frontmatter)
-        if (
+        if not force_full and (
             children is not None
             or composition_type == "router"
             or (composition_type == "invalid" and _has_composition_metadata(frontmatter))
