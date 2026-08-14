@@ -946,3 +946,157 @@ class TestSkillViewCollisionDetection:
         assert result["success"] is False
         assert "Ambiguous" in result["error"]
         assert len(result["matches"]) == 2
+
+class TestProgressiveSkillView:
+    def test_legacy_view_remains_full_and_projection_filters_links(self, tmp_path):
+        skill_dir = _make_skill(
+            tmp_path,
+            "progressive",
+            body=(
+                "## Prerequisites\nInstall tools.\n\n"
+                "## Deploy\nDeploy safely. See [guide](references/deploy.md).\n\n"
+                "## Other\nOther body. See references/other.md."
+            ),
+        )
+        references = skill_dir / "references"
+        references.mkdir()
+        (references / "deploy.md").write_text("deploy")
+        (references / "other.md").write_text("other")
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            legacy = json.loads(skill_view("progressive"))
+            projected = json.loads(
+                skill_view("progressive", heading="Deploy", max_chars=512)
+            )
+
+        assert "Other body" in legacy["content"]
+        assert set(legacy["linked_files"]["references"]) == {
+            "references/deploy.md",
+            "references/other.md",
+        }
+        assert projected["success"] is True
+        assert "## Deploy" in projected["content"]
+        assert "Prerequisites" in projected["content"]
+        assert "Other body" not in projected["content"]
+        assert list(projected["linked_files"]) == ["references/deploy.md"]
+        assert projected["projection"]["match_type"] == "exact"
+        assert projected["projection"]["returned_chars"] <= 512
+        assert projected["full_content_chars"] > len(projected["content"])
+
+    def test_projection_validation_and_schema(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "projection-errors")
+            both = json.loads(
+                skill_view("projection-errors", heading="A", query="B")
+            )
+            linked = json.loads(
+                skill_view(
+                    "projection-errors",
+                    file_path="references/a.md",
+                    max_chars=256,
+                )
+            )
+        assert both["error_code"] == "skill_view_invalid_projection"
+        assert linked["error_code"] == "skill_view_invalid_projection"
+        assert skills_tool_module.SKILL_VIEW_SCHEMA["parameters"]["properties"]["max_chars"] == {
+            "type": "integer",
+            "minimum": 256,
+            "maximum": 50000,
+        }
+        assert skills_tool_module.SKILL_VIEW_SCHEMA["parameters"]["properties"]["children"]["maxItems"] == 64
+
+    def test_registered_progressive_view_bypasses_legacy_dedup(self, tmp_path):
+        from tools.skills_tool import _skill_view_with_bump, reset_skill_view_dedup
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "progressive-dedup",
+                body="## A\nAlpha body.\n\n## B\nBeta body.",
+            )
+            reset_skill_view_dedup("progressive-task")
+            full = json.loads(
+                _skill_view_with_bump(
+                    {"name": "progressive-dedup"}, task_id="progressive-task"
+                )
+            )
+            projected = json.loads(
+                _skill_view_with_bump(
+                    {"name": "progressive-dedup", "heading": "B"},
+                    task_id="progressive-task",
+                )
+            )
+        assert "Alpha body" in full["content"]
+        assert projected.get("dedup") is not True
+        assert "Beta body" in projected["content"]
+        assert "Alpha body" not in projected["content"]
+
+    def test_router_defaults_to_inventory_and_selects_no_sibling_body(self, tmp_path):
+        router_extra = (
+            "metadata:\n  hermes:\n    composition:\n      type: router\n"
+            "      invariants:\n        safety: [secrets=redact]\n"
+            "      children:\n"
+            "        - id: ci\n          skill: ci-child\n          trigger: Diagnose CI\n"
+            "        - id: visual\n          skill: visual-child\n          trigger: Review screenshots\n"
+        )
+        _make_skill(tmp_path, "router", frontmatter_extra=router_extra, body="ROUTER BODY")
+        _make_skill(
+            tmp_path,
+            "ci-child",
+            frontmatter_extra="metadata:\n  hermes:\n    composition:\n      type: procedure\n",
+            body="SECRET CI BODY",
+        )
+        _make_skill(
+            tmp_path,
+            "visual-child",
+            frontmatter_extra="metadata:\n  hermes:\n    composition:\n      type: procedure\n",
+            body="SECRET VISUAL BODY",
+        )
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            inventory = json.loads(skill_view("router"))
+            none_selected = json.loads(skill_view("router", children=[]))
+            selected = json.loads(skill_view("router", children=["visual"]))
+
+        assert inventory["success"] is True
+        assert "ci: Diagnose CI" in inventory["content"]
+        assert "visual: Review screenshots" in inventory["content"]
+        assert "SECRET CI BODY" not in inventory["content"]
+        assert inventory["composition_invariants"]["safety"] == ["secrets=redact"]
+        assert inventory["composition"]["cost"]["direct_child_chars"] > 0
+        assert none_selected["content"] == ""
+        assert none_selected["composition"]["selected_children"] == []
+        assert none_selected["projection"]["omitted_count"] == 2
+        assert selected["content"] == "- visual: Review screenshots"
+        assert [c["id"] for c in selected["composition"]["selected_children"]] == ["visual"]
+        assert "SECRET VISUAL BODY" not in selected["content"]
+
+    def test_declared_malformed_composition_fails_without_selection(self, tmp_path):
+        _make_skill(
+            tmp_path,
+            "malformed-composition",
+            frontmatter_extra=(
+                "metadata:\n  hermes:\n    composition:\n      type: router\n"
+                "      children: not-a-list\n"
+            ),
+        )
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            result = json.loads(skill_view("malformed-composition"))
+        assert result["success"] is False
+        assert result["error_code"] == "composition_invalid_metadata"
+
+    def test_router_missing_child_and_flat_child_selection_fail_stably(self, tmp_path):
+        _make_skill(
+            tmp_path,
+            "broken-router",
+            frontmatter_extra=(
+                "metadata:\n  hermes:\n    composition:\n      type: router\n"
+                "      children:\n        - id: gone\n          skill: gone\n          trigger: Missing\n"
+            ),
+        )
+        _make_skill(tmp_path, "flat")
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            missing = json.loads(skill_view("broken-router"))
+            undeclared = json.loads(skill_view("flat", children=["x"]))
+        assert missing["success"] is False
+        assert missing["error_code"] == "composition_missing_child"
+        assert undeclared["success"] is False
+        assert undeclared["error_code"] == "composition_child_not_declared"

@@ -70,6 +70,8 @@ import json
 import logging
 import time
 import threading
+import hashlib
+import copy
 
 from hermes_constants import get_hermes_home, display_hermes_home
 import os
@@ -758,10 +760,13 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                 category = _get_category_from_path(skill_md)
 
                 seen_names.add(name)
+                from agent.skill_topology import normalize_skill_topology
+
                 skills.append({
                     "name": name,
                     "description": description,
                     "category": category,
+                    "topology": normalize_skill_topology(frontmatter),
                 })
 
             except (UnicodeDecodeError, PermissionError) as e:
@@ -809,17 +814,29 @@ def skills_list(category: str = None, task_id: str = None) -> str:
         all_skills = _find_all_skills()
         try:
             from hermes_cli.plugins import discover_plugins, get_plugin_manager
+            from agent.skill_topology import normalize_skill_topology
 
             discover_plugins()
             for plugin_skill in get_plugin_manager().list_plugin_skill_metadata():
                 frontmatter = plugin_skill.pop("frontmatter", {})
                 if not skill_matches_platform(frontmatter):
                     continue
+                if not skill_matches_environment(frontmatter):
+                    continue
                 if _is_skill_disabled(plugin_skill["name"]):
                     continue
+                plugin_skill["topology"] = normalize_skill_topology(frontmatter)
                 all_skills.append(plugin_skill)
         except Exception:
             logger.debug("Plugin skill listing failed", exc_info=True)
+
+        from agent.skill_topology import validate_skill_topology
+
+        topology = validate_skill_topology(
+            {skill["name"]: skill["topology"] for skill in all_skills}
+        )["skills"]
+        for skill in all_skills:
+            skill["topology"] = topology[skill["name"]]
 
         if not all_skills:
             return json.dumps(
@@ -870,6 +887,11 @@ def _serve_plugin_skill(
     *,
     preprocess: bool = True,
     session_id: str | None = None,
+    heading: str | None = None,
+    query: str | None = None,
+    max_chars: int | None = None,
+    children: list[str] | None = None,
+    force_full: bool = False,
 ) -> str:
     """Read a plugin-provided skill, apply guards, return JSON."""
     from hermes_cli.plugins import _get_disabled_plugins, get_plugin_manager
@@ -978,7 +1000,8 @@ def _serve_plugin_skill(
             ensure_ascii=False,
         )
 
-    # Injection scan — log but still serve (matches local-skill behaviour)
+    # Progressive projection is applied after preprocessing, and never includes
+    # the legacy sibling banner in the selected source.
     if any(p in content.lower() for p in _INJECTION_PATTERNS):
         logger.warning(
             "Plugin skill '%s:%s' contains patterns that may indicate prompt injection",
@@ -1022,17 +1045,42 @@ def _serve_plugin_skill(
                 "Could not preprocess plugin skill %s:%s", namespace, bare, exc_info=True
             )
 
-    return json.dumps(
-        {
-            "success": True,
-            "name": f"{namespace}:{bare}",
-            "content": f"{banner}{rendered_content}" if banner else rendered_content,
-            "description": description,
-            "linked_files": _plugin_skill_linked_files(skill_md.parent),
-            "readiness_status": SkillReadinessStatus.AVAILABLE.value,
-        },
-        ensure_ascii=False,
-    )
+    projected = None
+    full_content_chars = len(rendered_content)
+    if heading is not None or query is not None or max_chars is not None:
+        from agent.skill_composition import select_skill_content
+        if heading is not None and query is not None:
+            return json.dumps({"success": False, "error_code": "skill_view_invalid_projection", "error": "heading and query are mutually exclusive"}, ensure_ascii=False)
+        try:
+            projected = select_skill_content(rendered_content, heading=heading, query=query, max_chars=max_chars or 8000, linked_files=_plugin_skill_linked_files(skill_md.parent))
+            rendered_content = projected.pop("content")
+        except ValueError as exc:
+            return json.dumps({"success": False, "error_code": "skill_view_invalid_projection", "error": str(exc)}, ensure_ascii=False)
+
+    result = {
+        "success": True,
+        "name": f"{namespace}:{bare}",
+        "content": f"{banner}{rendered_content}" if banner and projected is None else rendered_content,
+        "description": description,
+        "linked_files": (projected or {}).get("linked_files") if projected is not None else _plugin_skill_linked_files(skill_md.parent),
+        "readiness_status": SkillReadinessStatus.AVAILABLE.value,
+    }
+    if projected is not None:
+        result["projection"] = projected
+        result["full_content_chars"] = full_content_chars
+    composition_type = _composition_type(parsed_frontmatter)
+    if not force_full and (
+        children is not None
+        or composition_type == "router"
+        or (composition_type == "invalid" and _has_composition_metadata(parsed_frontmatter))
+    ):
+        result = _apply_composition(
+            result,
+            f"{namespace}:{bare}",
+            children,
+            max_chars=max_chars or 8000,
+        )
+    return json.dumps(result, ensure_ascii=False)
 
 
 def _plugin_skill_linked_files(skill_root: Path) -> Dict[str, List[str]] | None:
@@ -1054,11 +1102,147 @@ def _plugin_skill_linked_files(skill_root: Path) -> Dict[str, List[str]] | None:
     return linked or None
 
 
+def _composition_metadata_resolver():
+    """Resolve bounded SKILL.md frontmatter without executing skill behavior."""
+    from copy import deepcopy
+
+    from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+
+    roots = [_skills_dir(), *get_external_skills_dirs()]
+    indexed: dict[str, dict] = {}
+    indexed_plugins: dict[str, dict] = {}
+
+    def with_content_chars(frontmatter: dict, size: int) -> dict:
+        enriched = deepcopy(frontmatter)
+        metadata = enriched.get("metadata")
+        hermes = metadata.get("hermes") if isinstance(metadata, dict) else None
+        canonical = hermes.get("composition") if isinstance(hermes, dict) else None
+        alias = enriched.get("composition")
+        target = canonical if isinstance(canonical, dict) else alias
+        if isinstance(target, dict):
+            target.setdefault("content_chars", size)
+        return enriched
+
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in iter_skill_index_files(root, "SKILL.md"):
+            try:
+                text = path.read_text(encoding="utf-8-sig", errors="replace")
+                frontmatter, _ = _parse_frontmatter(text)
+            except Exception:
+                continue
+            enriched = with_content_chars(frontmatter, len(text))
+            identifiers = [
+                path.parent.name,
+                frontmatter.get("name"),
+                path.parent.relative_to(root).as_posix(),
+            ]
+            for identifier in identifiers:
+                if isinstance(identifier, str) and identifier:
+                    indexed.setdefault(identifier, enriched)
+
+    def load(skill_id):
+        if skill_id in indexed:
+            return indexed[skill_id]
+        if skill_id in indexed_plugins:
+            return indexed_plugins[skill_id]
+        try:
+            from hermes_cli.plugins import get_plugin_manager
+
+            path = get_plugin_manager().find_plugin_skill(skill_id)
+            if path:
+                text = path.read_text(encoding="utf-8-sig", errors="replace")
+                frontmatter, _ = _parse_frontmatter(text)
+                enriched = with_content_chars(frontmatter, len(text))
+                indexed_plugins[skill_id] = enriched
+                return enriched
+        except Exception:
+            logger.debug("Could not resolve composition metadata for %s", skill_id, exc_info=True)
+        return None
+
+    return load
+
+
+def _has_composition_metadata(frontmatter: dict) -> bool:
+    if "composition" in frontmatter:
+        return True
+    metadata = frontmatter.get("metadata")
+    hermes = metadata.get("hermes") if isinstance(metadata, dict) else None
+    return isinstance(hermes, dict) and "composition" in hermes
+
+
+def _composition_type(frontmatter: dict) -> str:
+    from agent.skill_composition import parse_composition_metadata
+
+    parsed = parse_composition_metadata(frontmatter)
+    return parsed.get("type", "flat") if parsed.get("success", True) else "invalid"
+
+
+def _bounded_router_inventory(children: list[dict], max_chars: int) -> tuple[str, bool]:
+    content = "\n".join(
+        f"- {child['id']}: {child.get('trigger', '')}" for child in children
+    )
+    marker = "\n[... router inventory truncated ...]"
+    if len(content) <= max_chars:
+        return content, False
+    return content[: max_chars - len(marker)] + marker, True
+
+
+def _apply_composition(result, name, children, *, max_chars=8000):
+    from agent.skill_composition import validate_skill_composition
+
+    validation = validate_skill_composition(
+        name,
+        load_metadata=_composition_metadata_resolver(),
+        selected_children=children,
+    )
+    result["composition"] = validation
+    if not validation.get("success"):
+        result["success"] = False
+        result["error_code"] = validation.get(
+            "error_code", "composition_invalid_metadata"
+        )
+        result["error"] = validation.get(
+            "error_code", "composition_invalid_metadata"
+        )
+        return result
+    if validation.get("type") == "router":
+        result.setdefault("full_content_chars", len(result.get("content", "")))
+        result["composition_invariants"] = validation.get(
+            "inherited_invariants", {}
+        )
+        inventory = (
+            validation["selected_children"]
+            if children is not None
+            else validation["available_children"]
+        )
+        content, truncated = _bounded_router_inventory(inventory, max_chars)
+        result["content"] = content
+        result["linked_files"] = None
+        result["projection"] = {
+            "match_type": "composition",
+            "returned_chars": len(content),
+            "total_chars": validation["cost"]["direct_child_chars"],
+            "truncated": truncated,
+            "omitted_count": max(
+                0, len(validation["available_children"]) - len(inventory)
+            ),
+        }
+    return result
+
+
 def skill_view(
     name: str,
     file_path: str = None,
     task_id: str = None,
     preprocess: bool = True,
+    *,
+    heading: str | None = None,
+    query: str | None = None,
+    max_chars: int | None = None,
+    children: list[str] | None = None,
+    force_full: bool = False,
 ) -> str:
     """
     View the content of a skill or a specific file within a skill directory.
@@ -1076,6 +1260,13 @@ def skill_view(
         JSON string with skill content or error message
     """
     try:
+        if file_path and (heading is not None or query is not None or max_chars is not None or children is not None):
+            return json.dumps({"success": False, "error_code": "skill_view_invalid_projection", "error": "file_path cannot be combined with progressive arguments"}, ensure_ascii=False)
+        if heading is not None and query is not None:
+            return json.dumps({"success": False, "error_code": "skill_view_invalid_projection", "error": "heading and query are mutually exclusive"}, ensure_ascii=False)
+        # Validate projection bounds early for direct calls.
+        if max_chars is not None and not 256 <= max_chars <= 50000:
+            return json.dumps({"success": False, "error_code": "skill_view_invalid_projection", "error": "max_chars must be between 256 and 50000"}, ensure_ascii=False)
         # Validate before the ':' qualified-name dispatch so a Windows drive
         # path (e.g. C:\skills\foo) can't be reinterpreted as a plugin
         # namespace, and so a traversal/absolute name never reaches the
@@ -1139,6 +1330,11 @@ def skill_view(
                     file_path=file_path,
                     preprocess=preprocess,
                     session_id=task_id,
+                    heading=heading,
+                    query=query,
+                    max_chars=max_chars,
+                    children=children,
+                    force_full=force_full,
                 )
 
             # Plugin exists but this specific skill is missing?
@@ -1764,6 +1960,14 @@ def skill_view(
         if capture_result["gateway_setup_hint"]:
             result["gateway_setup_hint"] = capture_result["gateway_setup_hint"]
 
+        if heading is not None or query is not None or max_chars is not None:
+            from agent.skill_composition import select_skill_content
+            projection = select_skill_content(rendered_content, heading=heading, query=query, max_chars=max_chars or 8000, linked_files=linked_files)
+            result["full_content_chars"] = len(rendered_content)
+            result["projection"] = {k: v for k, v in projection.items() if k != "content"}
+            result["content"] = projection["content"]
+            result["linked_files"] = projection.get("linked_files") or None
+
         try:
             from tools.skill_manager_tool import mark_background_review_skill_read
 
@@ -1796,6 +2000,19 @@ def skill_view(
             result["compatibility"] = frontmatter["compatibility"]
         if isinstance(metadata, dict):
             result["metadata"] = metadata
+
+        composition_type = _composition_type(frontmatter)
+        if not force_full and (
+            children is not None
+            or composition_type == "router"
+            or (composition_type == "invalid" and _has_composition_metadata(frontmatter))
+        ):
+            result = _apply_composition(
+                result,
+                str(skill_name),
+                children,
+                max_chars=max_chars or 8000,
+            )
 
         return json.dumps(result, ensure_ascii=False)
 
@@ -1881,6 +2098,10 @@ SKILL_VIEW_SCHEMA = {
                 "type": "string",
                 "description": "OPTIONAL: Path to a linked file within the skill (e.g., 'references/api.md', 'templates/config.yaml', 'scripts/validate.py'). Omit to get the main SKILL.md content.",
             },
+            "heading": {"type": "string"},
+            "query": {"type": "string"},
+            "max_chars": {"type": "integer", "minimum": 256, "maximum": 50000},
+            "children": {"type": "array", "items": {"type": "string"}, "maxItems": 64},
         },
         "required": ["name"],
     },
@@ -1903,106 +2124,124 @@ registry.register(
 # conversation already carries it verbatim. Cleared on context compression
 # via reset_skill_view_dedup() (wired next to read_file's reset_file_dedup)
 # because after compression the original content is summarized away.
-_skill_view_tracker: Dict[str, Dict[tuple, tuple]] = {}
+_skill_view_tracker: Dict[str, Dict[str, dict]] = {}
+_skill_view_scope_tasks: Dict[str, set[str]] = {}
 _skill_view_tracker_lock = threading.Lock()
 _SKILL_VIEW_DEDUP_CAP = 200
-
+_SKILL_VIEW_SCOPE_ALIAS_CAP = 200
 _SKILL_VIEW_DEDUP_MESSAGE = (
-    "Skill content unchanged since it was loaded earlier in this "
-    "conversation — refer to the earlier skill_view result; it is still "
-    "current and complete. (Re-issued after context compression, this "
-    "returns the full content again.)"
+    "Skill content unchanged since it was loaded earlier in this conversation — "
+    "refer to the earlier skill_view result; it is still current and complete."
 )
 
 
-def _skill_view_fingerprint(payload: dict) -> tuple | None:
-    """Stat the skill file a successful skill_view served, for change detection."""
-    src = payload.get("_source_path")
-    if not src:
-        return None
-    try:
-        st = os.stat(src)
-        return (src, st.st_mtime_ns, st.st_size)
-    except OSError:
-        return None
+def _skill_view_identity(args, payload):
+    name = str(payload.get("name") or args.get("name") or "")
+    source_path = payload.get("_source_path")
+    source_identity = (
+        hashlib.sha256(
+            os.path.realpath(str(source_path)).encode("utf-8")
+        ).hexdigest()
+        if source_path
+        else None
+    )
+    max_chars = args.get("max_chars")
+    progressive = bool(payload.get("projection")) or any(
+        key in args for key in ("heading", "query", "max_chars", "children")
+    )
+    if progressive and max_chars is None:
+        max_chars = 8000
+    children = args.get("children", "__omitted__")
+    if children != "__omitted__":
+        children = None if children is None else sorted(set(children))
+    retrieval = {
+        "name": name,
+        "source_identity": source_identity,
+        "file_path": args.get("file_path"),
+                 "heading": args.get("heading"), "query": args.get("query"),
+                 "max_chars": max_chars, "children": children}
+    rid = hashlib.sha256(json.dumps(retrieval, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    visible = copy.deepcopy(payload)
+    visible.pop("_source_path", None)
+    visible.pop("content_hash", None)
+    visible.pop("retrieval_id", None)
+    chash = hashlib.sha256(json.dumps(visible, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    return rid, chash, retrieval
 
 
-def _record_skill_view(task_id, name, file_path, payload: dict) -> None:
-    """Record a served skill_view so an identical repeat can be deduped."""
-    if not task_id:
+def _skill_view_scope(task_id, session_id):
+    return "session:" + str(session_id) if session_id else ("task:" + str(task_id) if task_id else None)
+
+
+def _associate_skill_view_scope(task_id, scope):
+    if not task_id or not scope:
         return
-    # Never dedup setup-needed views: readiness depends on config/env state
-    # that can change without the skill file changing, and the model must
-    # see the refreshed setup status on a re-view.
-    if payload.get("setup_needed") or payload.get("readiness_status") == "setup_needed":
-        return
-    fp = _skill_view_fingerprint(payload)
-    if fp is None:
-        return
-    key = (str(payload.get("name") or name), file_path or "")
+    task_key = str(task_id)
+    scopes = _skill_view_scope_tasks.setdefault(task_key, set())
+    scopes.add(scope)
+    while len(_skill_view_scope_tasks) > _SKILL_VIEW_SCOPE_ALIAS_CAP:
+        oldest_task = next(iter(_skill_view_scope_tasks))
+        if oldest_task == task_key and len(_skill_view_scope_tasks) == 1:
+            break
+        evicted_scopes = _skill_view_scope_tasks.pop(oldest_task, set())
+        for evicted_scope in evicted_scopes:
+            _skill_view_tracker.pop(evicted_scope, None)
+            for aliases in _skill_view_scope_tasks.values():
+                aliases.discard(evicted_scope)
+
+
+def reset_skill_view_dedup(task_id: str | None = None) -> None:
     with _skill_view_tracker_lock:
-        cache = _skill_view_tracker.setdefault(str(task_id), {})
-        cache[key] = fp
-        while len(cache) > _SKILL_VIEW_DEDUP_CAP:
-            try:
-                cache.pop(next(iter(cache)))
-            except (StopIteration, KeyError):
-                break
+        if task_id is None:
+            _skill_view_tracker.clear(); _skill_view_scope_tasks.clear()
+        else:
+            task_key = str(task_id)
+            scopes = _skill_view_scope_tasks.pop(task_key, set()) | {
+                "task:" + task_key
+            }
+            for scope in scopes:
+                _skill_view_tracker.pop(scope, None)
+            for aliases in _skill_view_scope_tasks.values():
+                aliases.difference_update(scopes)
 
 
-def _check_skill_view_dedup(task_id, name, file_path) -> str | None:
-    """Return a dedup stub when this exact skill file was already served
-    to this task and is unchanged on disk; None otherwise."""
-    if not task_id:
+def _skill_view_check_or_record(
+    scope,
+    task_id,
+    retrieval_id,
+    content_hash,
+    payload,
+    retrieval,
+):
+    if not scope:
         return None
     with _skill_view_tracker_lock:
-        cache = _skill_view_tracker.get(str(task_id))
-        if not cache:
-            return None
-        # The record key uses the RESOLVED name; check both the raw arg and
-        # resolved forms so 'category/skill' and bare-name views coalesce.
-        for key, (src, mtime_ns, size) in list(cache.items()):
-            rec_name, rec_fp = key
-            if rec_fp != (file_path or ""):
-                continue
-            if rec_name != str(name) and not str(name).endswith("/" + rec_name) \
-                    and not rec_name.endswith("/" + str(name)) \
-                    and str(name).split(":")[-1] != rec_name:
-                continue
-            try:
-                st = os.stat(src)
-                if (st.st_mtime_ns, st.st_size) != (mtime_ns, size):
-                    cache.pop(key, None)
-                    return None
-            except OSError:
-                cache.pop(key, None)
-                return None
+        _associate_skill_view_scope(task_id, scope)
+        cache = _skill_view_tracker.setdefault(scope, {})
+        prior = cache.get(retrieval_id)
+        if prior and prior["content_hash"] == content_hash:
             return json.dumps(
                 {
                     "success": True,
                     "status": "unchanged",
-                    "name": rec_name,
-                    "file": file_path or "SKILL.md",
+                    "name": payload.get("name"),
+                    "file": payload.get("file", "SKILL.md"),
                     "dedup": True,
                     "content_returned": False,
+                    "content_hash": content_hash,
+                    "retrieval_id": retrieval_id,
+                    "projection_identity": retrieval,
                     "message": _SKILL_VIEW_DEDUP_MESSAGE,
                 },
                 ensure_ascii=False,
             )
+        cache[retrieval_id] = {
+            "content_hash": content_hash,
+            "retrieval": retrieval,
+        }
+        while len(cache) > _SKILL_VIEW_DEDUP_CAP:
+            cache.pop(next(iter(cache)))
     return None
-
-
-def reset_skill_view_dedup(task_id: str | None = None) -> None:
-    """Clear the skill_view dedup cache (all tasks when task_id is None).
-
-    Called on context compression: the original skill content is
-    summarized away, so a re-view must return full content again.
-    """
-    with _skill_view_tracker_lock:
-        if task_id is None:
-            _skill_view_tracker.clear()
-        else:
-            _skill_view_tracker.pop(str(task_id), None)
 
 
 def _skill_view_with_bump(args, **kw):
@@ -2020,33 +2259,66 @@ def _skill_view_with_bump(args, **kw):
     # "skills must be loaded fully" rule is preserved — and the cache is
     # cleared on context compression (same hook as read_file's dedup)
     # so a post-compression re-view returns full content again.
-    stub = _check_skill_view_dedup(task_id, name, args.get("file_path"))
-    if stub is not None:
-        return stub
     result = skill_view(
-        name, file_path=args.get("file_path"), task_id=task_id
+        name, file_path=args.get("file_path"), task_id=task_id,
+        heading=args.get("heading"), query=args.get("query"),
+        max_chars=args.get("max_chars"), children=args.get("children"),
     )
     try:
         parsed = json.loads(result)
-        if isinstance(parsed, dict) and parsed.get("success"):
-            _record_skill_view(task_id, name, args.get("file_path"), parsed)
-            # Use the resolved skill name from the payload when present —
-            # qualified forms ("plugin:skill") return with the canonical name.
-            resolved = parsed.get("name") or name
-            if resolved:
-                from tools.skill_usage import bump_use, bump_view
-                bump_view(str(resolved))
-                # A skill_view tool call is the agent actively loading the skill
-                # to act on it — that counts as use, not just a browse/view.
-                # Curator's stale timer keys off last_used_at (see agent/curator.py).
-                bump_use(
-                    str(resolved),
-                    task_id=kw.get("task_id"),
-                    session_id=kw.get("session_id"),
-                )
-    except Exception:
-        pass
-    return result
+    except (TypeError, ValueError):
+        return result
+    if not isinstance(parsed, dict) or not parsed.get("success"):
+        return result
+
+    try:
+        retrieval_id, content_hash, retrieval = _skill_view_identity(args, parsed)
+    except Exception as exc:
+        logger.warning("Could not compute skill_view content identity", exc_info=True)
+        return json.dumps(
+            {
+                "success": False,
+                "error_code": "skill_view_identity_failed",
+                "error": "Could not compute a safe skill content identity",
+                "name": parsed.get("name") or name,
+            },
+            ensure_ascii=False,
+        )
+
+    parsed["retrieval_id"] = retrieval_id
+    parsed["content_hash"] = content_hash
+    parsed.pop("_source_path", None)
+    setup_needed = parsed.get("setup_needed") or (
+        parsed.get("readiness_status") == "setup_needed"
+    )
+    if setup_needed:
+        return json.dumps(parsed, ensure_ascii=False)
+
+    scope = _skill_view_scope(task_id, kw.get("session_id"))
+    stub = _skill_view_check_or_record(
+        scope,
+        task_id,
+        retrieval_id,
+        content_hash,
+        parsed,
+        retrieval,
+    )
+    if stub is not None:
+        return stub
+    resolved = parsed.get("name") or name
+    if resolved:
+        try:
+            from tools.skill_usage import bump_use, bump_view
+
+            bump_view(str(resolved))
+            bump_use(
+                str(resolved),
+                task_id=task_id,
+                session_id=kw.get("session_id"),
+            )
+        except Exception:
+            logger.debug("Could not record skill usage", exc_info=True)
+    return json.dumps(parsed, ensure_ascii=False)
 
 
 registry.register(
