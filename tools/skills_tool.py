@@ -760,10 +760,13 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                 category = _get_category_from_path(skill_md)
 
                 seen_names.add(name)
+                from agent.skill_topology import normalize_skill_topology
+
                 skills.append({
                     "name": name,
                     "description": description,
                     "category": category,
+                    "topology": normalize_skill_topology(frontmatter),
                 })
 
             except (UnicodeDecodeError, PermissionError) as e:
@@ -811,17 +814,29 @@ def skills_list(category: str = None, task_id: str = None) -> str:
         all_skills = _find_all_skills()
         try:
             from hermes_cli.plugins import discover_plugins, get_plugin_manager
+            from agent.skill_topology import normalize_skill_topology
 
             discover_plugins()
             for plugin_skill in get_plugin_manager().list_plugin_skill_metadata():
                 frontmatter = plugin_skill.pop("frontmatter", {})
                 if not skill_matches_platform(frontmatter):
                     continue
+                if not skill_matches_environment(frontmatter):
+                    continue
                 if _is_skill_disabled(plugin_skill["name"]):
                     continue
+                plugin_skill["topology"] = normalize_skill_topology(frontmatter)
                 all_skills.append(plugin_skill)
         except Exception:
             logger.debug("Plugin skill listing failed", exc_info=True)
+
+        from agent.skill_topology import validate_skill_topology
+
+        topology = validate_skill_topology(
+            {skill["name"]: skill["topology"] for skill in all_skills}
+        )["skills"]
+        for skill in all_skills:
+            skill["topology"] = topology[skill["name"]]
 
         if not all_skills:
             return json.dumps(
