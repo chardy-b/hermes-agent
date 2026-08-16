@@ -364,6 +364,64 @@ class TestBuildSkillsSystemPrompt:
         second = build_skills_system_prompt()
         assert "cached-skill" not in second
 
+    def test_configured_prominent_roots_render_bounded_in_config_order(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skills_dir = tmp_path / "skills" / "tools"
+        for name, description in (("alpha", "Alpha root"), ("beta", "Beta root"), ("leaf", "Leaf")):
+            skill_dir = skills_dir / name
+            skill_dir.mkdir(parents=True)
+            role = "root" if name != "leaf" else "leaf"
+            eligible = "true" if name != "leaf" else "false"
+            (skill_dir / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: {description}\nskill_role: {role}\nroot_eligible: {eligible}\n---\n"
+            )
+        (tmp_path / "config.yaml").write_text(
+            "skills:\n  prominent_roots: [beta, alpha, alpha, missing, leaf]\n  root_catalog_limit: 2\n"
+        )
+
+        result = build_skills_system_prompt()
+
+        catalog = result.split("## Prominent skills\n", 1)[1].split("\n\n", 1)[0]
+        assert catalog.index("beta") < catalog.index("alpha")
+        assert "missing" not in catalog
+        assert "leaf" not in catalog
+        assert "Alpha root" in catalog and "Beta root" in catalog
+        assert "alpha" in result and "beta" in result and "leaf" in result
+
+    def test_invalid_prominent_root_config_fails_closed_without_hiding_skills(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "tools" / "root"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: root\ndescription: Root skill\nskill_role: root\nroot_eligible: true\n---\n"
+        )
+        (tmp_path / "config.yaml").write_text(
+            "skills:\n  prominent_roots: [root]\n  root_catalog_limit: nope\n"
+        )
+
+        result = build_skills_system_prompt()
+
+        assert "## Prominent skills" not in result
+        assert "root" in result
+
+    def test_configured_external_prominent_root_renders(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        external = tmp_path / "external"
+        skill_dir = external / "catalog" / "external-root"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: external-root\ndescription: External root\nskill_role: root\nroot_eligible: true\n---\n"
+        )
+        (tmp_path / "config.yaml").write_text(
+            f"skills:\n  external_dirs: [{external}]\n  prominent_roots: [external-root]\n"
+        )
+
+        result = build_skills_system_prompt()
+
+        assert "## Prominent skills\n- external-root: External root" in result
+
 
 
 

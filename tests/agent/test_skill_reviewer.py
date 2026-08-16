@@ -254,6 +254,31 @@ def test_review_is_deterministic_and_zero_or_negative_limit_is_empty(tmp_path):
     assert review_skills([tmp_path], usage={}, max_skills=-1)["skills"] == []
 
 
+def test_curator_reports_topology_diagnostics_without_selecting_roots(tmp_path):
+    router = _skill(tmp_path, "router")
+    (router.parent / "SKILL.md").write_text(
+        "---\nname: router\nskill_role: router\nchild_skills: [missing]\n---\nbody\n",
+        encoding="utf-8",
+    )
+    _skill(tmp_path, "candidate")
+    candidate = tmp_path / "candidate" / "SKILL.md"
+    candidate.write_text(
+        "---\nname: candidate\nskill_role: root\nroot_eligible: true\n---\nbody\n",
+        encoding="utf-8",
+    )
+
+    report = review_skills([tmp_path], usage={})
+
+    assert _row(report, "candidate")["topology"]["root_eligible"] is True
+    assert any(
+        diagnostic["code"] == "missing_child"
+        for diagnostic in _row(report, "router")["topology"]["diagnostics"]
+    )
+    assert report["stats"]["topology_diagnostics"] == 1
+    assert report["stats"]["root_eligible"] == 1
+    assert "prominent_roots" not in report
+
+
 def test_representative_repository_tree_satisfies_graph_and_bound_invariants(monkeypatch):
     root = Path(__file__).resolve().parents[2] / "skills"
     monkeypatch.setattr(skill_reviewer, "_MAX_BYTES", 10_000_000)
