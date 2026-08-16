@@ -17,6 +17,7 @@ from hermes_constants import get_hermes_home, get_skills_dir, is_wsl
 from typing import List, Optional
 
 from agent.runtime_cwd import resolve_agent_cwd
+from agent.skill_topology import normalize_skill_topology
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS,
     ORG_ACTIVE_MARKER,
@@ -27,6 +28,7 @@ from agent.skill_utils import (
     extract_skill_description,
     get_all_skills_dirs,
     get_disabled_skill_names,
+    get_prominent_roots_config,
     iter_skill_index_files,
     org_id_of_path,
     parse_frontmatter,
@@ -1478,7 +1480,7 @@ _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
 # v2: entries gained org provenance fields (org_id/org_author/rel_dir) for M2
 # org-shared skills; older snapshots are discarded and rebuilt.
-_SKILLS_SNAPSHOT_VERSION = 2
+_SKILLS_SNAPSHOT_VERSION = 3
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1614,6 +1616,7 @@ def _build_snapshot_entry(
         "description": description,
         "platforms": [str(p).strip() for p in platforms if str(p).strip()],
         "conditions": extract_skill_conditions(frontmatter),
+        "topology": normalize_skill_topology(frontmatter),
     }
     if org_id:
         entry["org_id"] = org_id
@@ -1746,6 +1749,7 @@ def build_skills_system_prompt(
     # produce distinct cache entries (gateway serves multiple platforms).
     _platform_hint = _current_session_platform_hint()
     disabled = get_disabled_skill_names(_platform_hint or None)
+    prominent_roots, root_catalog_limit = get_prominent_roots_config()
     cache_key = (
         str(skills_dir),
         tuple(str(d) for d in external_dirs),
@@ -1754,6 +1758,8 @@ def build_skills_system_prompt(
         _platform_hint,
         tuple(sorted(disabled)),
         tuple(sorted(compact_categories or ())),
+        prominent_roots,
+        root_catalog_limit,
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -1895,6 +1901,7 @@ def build_skills_system_prompt(
                 ):
                     continue
                 seen_skill_names.add(frontmatter_name)
+                visible_entries.append(entry)
                 skills_by_category.setdefault(entry["category"], []).append(
                     (frontmatter_name, entry["description"])
                 )
@@ -1914,6 +1921,32 @@ def build_skills_system_prompt(
                 category_descriptions.setdefault(cat, str(cat_desc).strip().strip("'\""))
             except Exception as e:
                 logger.debug("Could not read external skill description %s: %s", desc_file, e)
+
+    prominent_lines: list[str] = []
+    if prominent_roots and root_catalog_limit:
+        entries_by_name = {
+            str(entry.get("frontmatter_name") or entry.get("skill_name") or ""): entry
+            for entry in visible_entries
+        }
+        for name in prominent_roots:
+            entry = entries_by_name.get(name)
+            if not entry:
+                continue
+            topology = entry.get("topology")
+            if not isinstance(topology, dict):
+                continue
+            if topology.get("skill_role") != "root" or not topology.get("root_eligible"):
+                continue
+            description = str(entry.get("description") or "")
+            prominent_lines.append(f"- {name}: {description}" if description else f"- {name}")
+            if len(prominent_lines) >= root_catalog_limit:
+                break
+
+    prominent_catalog = (
+        "## Prominent skills\n" + "\n".join(prominent_lines) + "\n\n"
+        if prominent_lines
+        else ""
+    )
 
     # Posture-driven category demotion (e.g. non-coding skills while pairing
     # on code). Demoted categories stay in the index as a single names-only
@@ -1984,7 +2017,8 @@ def build_skills_system_prompt(
             "If a skill you loaded was missing steps, had wrong commands, or needed "
             "pitfalls you discovered, update it before finishing.\n"
             "\n"
-            "<available_skills>\n"
+            + prominent_catalog
+            + "<available_skills>\n"
             + "\n".join(index_lines) + "\n"
             "</available_skills>\n"
             "\n"

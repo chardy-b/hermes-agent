@@ -433,6 +433,33 @@ def _load_raw_config() -> Dict[str, Any]:
     return parsed
 
 
+def get_prominent_roots_config() -> tuple[tuple[str, ...], int]:
+    """Return validated configured root names and their bounded catalog limit.
+
+    Invalid configuration fails closed for prominence only; it never affects
+    normal skill indexing or direct loading.
+    """
+    skills_cfg = _load_raw_config().get("skills")
+    if not isinstance(skills_cfg, dict):
+        return (), 6
+    configured = skills_cfg.get("prominent_roots", [])
+    if configured is None:
+        configured = []
+    if not isinstance(configured, list) or not all(
+        isinstance(name, str) and name.strip() for name in configured
+    ):
+        return (), 6
+    limit = skills_cfg.get("root_catalog_limit", 6)
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+        return (), 6
+    names: list[str] = []
+    for name in configured:
+        name = name.strip()
+        if name not in names:
+            names.append(name)
+    return tuple(names), limit
+
+
 def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
     """Read disabled skill names from config.yaml.
 
