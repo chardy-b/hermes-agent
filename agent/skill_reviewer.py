@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from agent.skill_topology import normalize_skill_topology, validate_skill_topology
 from agent.skill_utils import is_excluded_skill_path, parse_frontmatter
 
 _MAX_SKILLS = 5000
@@ -49,6 +50,7 @@ def _empty() -> dict[str, Any]:
         "skills": 0, "edges": 0, "shortening_candidates": 0, "bytes_scanned": 0,
         "bytes_selected": 0, "duplicates": 0, "files_scanned": 0,
         "max_bytes": _MAX_BYTES, "max_files": _MAX_FILES, "truncated": False,
+        "topology_diagnostics": 0, "root_eligible": 0,
     }}
 
 
@@ -218,6 +220,11 @@ def review_skills(roots: list[Path], usage: dict[str, dict[str, Any]] | None = N
                "references": refs, "declared_references": refs, "heuristic_references": [], "callers": callers}
         records.append(row)
     by_name = {r["name"]: r for r in records}
+    topologies = validate_skill_topology(
+        {name: normalize_skill_topology(selected[name][1]) for name in by_name}
+    )["skills"]
+    for name, row in by_name.items():
+        row["topology"] = topologies[name]
     for r in records:
         for target in r["references"]:
             by_name[target]["callers"].append(r["name"])
@@ -232,4 +239,6 @@ def review_skills(roots: list[Path], usage: dict[str, dict[str, Any]] | None = N
             "duplicates": sorted(duplicates, key=lambda d: (d["name"], d["discarded"])),
             "stats": {"skills": len(records), "edges": sum(len(r["references"]) for r in records), "shortening_candidates": candidates,
                       "bytes_scanned": bytes_scanned, "bytes_selected": bytes_selected, "duplicates": len(duplicates),
-                      "files_scanned": files_scanned, "max_bytes": _MAX_BYTES, "max_files": _MAX_FILES, "truncated": truncated}}
+                      "files_scanned": files_scanned, "max_bytes": _MAX_BYTES, "max_files": _MAX_FILES, "truncated": truncated,
+                      "topology_diagnostics": sum(len(row["topology"]["diagnostics"]) for row in records),
+                      "root_eligible": sum(bool(row["topology"]["root_eligible"]) for row in records)}}
