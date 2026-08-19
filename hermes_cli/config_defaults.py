@@ -2720,6 +2720,19 @@ DEFAULT_CONFIG = {
             # bounding CPU / memory / upstream-LLM-quota exhaustion from a
             # request flood. Set to 0 to disable the cap entirely.
             "max_concurrent_runs": 10,
+            # Contract-backed Android companion pairing routes. Disabled until
+            # an operator supplies the exact externally visible HTTPS origin;
+            # secrets continue to use API_SERVER_KEY and are never config keys.
+            "companion": {
+                "enabled": False,
+                "gateway_origin": "",
+                "invitation_ttl_seconds": 300,
+                # Explicit policy grant for the API-server operator principal.
+                "operator_scopes": [],
+                # Opt in only when HTTPS terminates at a reverse proxy on the
+                # same host and the API server itself remains loopback-bound.
+                "trusted_loopback_proxy": False,
+            },
         },
     },
 

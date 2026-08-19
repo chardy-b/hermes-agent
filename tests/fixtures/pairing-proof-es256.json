@@ -1,0 +1,37 @@
+{
+  "fixtureVersion": 1,
+  "purpose": "Normative pairing-proof-1 ES256/SPKI/DER conformance vector",
+  "publicKeySpkiDerBase64Url": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE_8N4DZWhN5v4OfqTsaJolvDdAWkGlCpUSSLGwGYEMEDZ7D5xvTHJK8F2m3XVcNBKw3c6J-hksMAXXh9IWpcxPw",
+  "keyId": "pk_3FPDfbWlLDUIx15RAVEikVo1HMmPbPXBiyGJ7OCBv6k",
+  "challengeFields": {
+    "clientNonce": "AAECAwQFBgcICQoLDA0ODw",
+    "deviceName": "Fixture Pixel",
+    "gatewayOrigin": "https://gateway.example.test",
+    "invitationCode": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+    "invitationId": "inv_fixture_01",
+    "keyId": "pk_3FPDfbWlLDUIx15RAVEikVo1HMmPbPXBiyGJ7OCBv6k",
+    "protocolRevision": "pairing-proof-1",
+    "publicKey": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE_8N4DZWhN5v4OfqTsaJolvDdAWkGlCpUSSLGwGYEMEDZ7D5xvTHJK8F2m3XVcNBKw3c6J-hksMAXXh9IWpcxPw"
+  },
+  "canonicalChallengeUtf8": "HERMES-COMPANION-PAIRING-V1\u0000{\"clientNonce\":\"AAECAwQFBgcICQoLDA0ODw\",\"deviceName\":\"Fixture Pixel\",\"gatewayOrigin\":\"https://gateway.example.test\",\"invitationCode\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\",\"invitationId\":\"inv_fixture_01\",\"keyId\":\"pk_3FPDfbWlLDUIx15RAVEikVo1HMmPbPXBiyGJ7OCBv6k\",\"protocolRevision\":\"pairing-proof-1\",\"publicKey\":\"MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE_8N4DZWhN5v4OfqTsaJolvDdAWkGlCpUSSLGwGYEMEDZ7D5xvTHJK8F2m3XVcNBKw3c6J-hksMAXXh9IWpcxPw\"}",
+  "canonicalChallengeSha256Base64Url": "-fWOGo8QY0N_mCPHsofTLHJaZMhrASHaSOXRRbs8LtY",
+  "signatureFormat": "asn1-der-base64url",
+  "signatureBase64Url": "MEUCIQDwE1l2FqVeRMUjCbqisN5mwjB1WimwKgR_dxylBXmO4wIgTyhQqiS0znEHFkGY_nlb5NIWqDjTOnm3Vw1sWFDuWH8",
+  "negativeCases": [
+    {"name": "changed-invitation", "replaceField": "invitationId", "value": "inv_fixture_02", "expectedError": "invalid_signature"},
+    {"name": "changed-origin", "replaceField": "gatewayOrigin", "value": "https://evil.example.test", "expectedError": "invalid_signature"},
+    {"name": "wrong-key-id", "replaceField": "keyId", "value": "pk_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "expectedError": "invalid_key"},
+    {"name": "non-nfc-device-name", "replaceField": "deviceName", "value": "Café Pixel", "expectedError": "invalid_request"},
+    {"name": "unexpected-challenge-field", "addField": "serverNonce", "value": "AAAAAAAAAAAAAAAAAAAAAA", "expectedError": "invalid_request"}
+  ],
+  "invalidGatewayOrigins": [
+    "http://gateway.example.test",
+    "https://Gateway.example.test",
+    "https://gateway.example.test/",
+    "https://gateway.example.test/path",
+    "https://gateway.example.test?query=1",
+    "https://gateway.example.test#fragment",
+    "https://gateway.example.test:443",
+    "https://user@gateway.example.test"
+  ]
+}
