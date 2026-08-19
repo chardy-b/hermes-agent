@@ -1,0 +1,912 @@
+openapi: 3.1.0
+info:
+  title: Hermes Android Companion API
+  version: 1.1.0
+  description: |
+    Versioned companion contract. Contract version is companion-v1. Clients MUST
+    tolerate unknown fields and unknown event types. Compatibility policy:
+    additive changes are backward compatible; removing or changing the meaning
+    of a field, event, or operation requires a new major contract version.
+    Pairing proof revision `pairing-proof-1` is a pre-implementation security
+    correction: the earlier code-only pairing shapes were never safe to deploy
+    and MUST NOT be implemented as a downgrade path.
+servers:
+  - url: /companion/v1
+    description: Companion API base path
+security:
+  - deviceAccessToken: []
+    deviceProof: []
+x-transport-requirements:
+  productionTlsMinimum: TLS-1.2
+  authenticatedServerCertificate: true
+  plaintextHttpPermitted: false
+  description: Production endpoints fail closed unless HTTPS certificate and hostname validation succeeds.
+x-websocket-revocation:
+  authentication: Access token plus device proof during the HTTPS upgrade; credentials MUST NOT appear in the URL.
+  revalidation: Server checks device/session revocation state during the connection and before each privileged delivery.
+  revokedCloseDeadlineSeconds: 5
+  revokedCloseCode: 4401
+  revokedCloseReason: device_revoked
+x-authorization-boundary:
+  devicePrincipal: May access only resources owned by its authenticated deviceId; path/body IDs never grant authority.
+  operatorPrincipal: Requires an explicit operator scope and policy grant for every cross-device list/revoke action.
+  revocationStateUnavailable: deny
+tags:
+  - name: Pairing
+  - name: Bootstrap
+  - name: Sessions
+  - name: Activities
+  - name: Cron
+  - name: Devices
+  - name: Events
+paths:
+  /pairing/invitations:
+    post:
+      tags: [Pairing]
+      security: [{ operatorBearerAuth: [] }]
+      operationId: createPairingInvitation
+      summary: Create a short-lived device pairing invitation
+      description: Requires an authenticated local user or control-plane operator. Invitations contain 256 bits of entropy, expire within five minutes, are single-use, and are stored server-side only as a verifier/hash.
+      parameters: [{ $ref: '#/components/parameters/IdempotencyKey' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PairingInvitationRequest' }
+      responses:
+        '201':
+          description: Pairing invitation created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PairingInvitation' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /pairing/redeem:
+    post:
+      tags: [Pairing]
+      security: []
+      operationId: redeemPairingInvitation
+      summary: Redeem an invitation with Android Keystore proof of possession
+      description: Application authentication is the invitation secret plus the invitation-bound ES256 proof. TLS is mandatory. The invitation is atomically consumed only after every proof check succeeds.
+      parameters: [{ $ref: '#/components/parameters/IdempotencyKey' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PairingRedeemRequest' }
+      responses:
+        '200':
+          description: Pairing completed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PairingResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '426': { $ref: '#/components/responses/UpgradeRequired' }
+  /pairing/start:
+    post:
+      deprecated: true
+      tags: [Pairing]
+      security: [{ operatorBearerAuth: [] }]
+      operationId: startPairingLegacy
+      summary: Deprecated alias for POST /pairing/invitations
+      description: Exact authenticated alias. It MUST NOT restore unauthenticated invitation creation.
+      parameters: [{ $ref: '#/components/parameters/IdempotencyKey' }]
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: '#/components/schemas/PairingInvitationRequest' } }
+      responses:
+        '201':
+          description: Deprecated pairing invitation
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/PairingInvitation' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /pairing/complete:
+    post:
+      deprecated: true
+      tags: [Pairing]
+      security: []
+      operationId: completePairingLegacy
+      summary: Deprecated alias for POST /pairing/redeem
+      description: Exact proof-enforcing alias. Code-plus-device-name requests fail with pairing_protocol_upgrade_required; no compatibility downgrade exists.
+      parameters: [{ $ref: '#/components/parameters/IdempotencyKey' }]
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: '#/components/schemas/PairingRedeemRequest' } }
+      responses:
+        '200':
+          description: Deprecated pairing completion
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/PairingResult' } }
+        '426': { $ref: '#/components/responses/UpgradeRequired' }
+  /auth/refresh:
+    post:
+      tags: [Pairing]
+      security: [{ deviceProof: [] }]
+      operationId: refreshDeviceCredentials
+      summary: Rotate a single-use refresh token bound to the registered device key
+      description: The DPoP `ath` claim is unpadded base64url SHA-256 of the exact refresh-token ASCII bytes. Verify current registered-key signature, 60-second iat window, unique jti, canonical htm/htu, current session/revocation epoch, then ath; only then atomically consume and rotate the token. Reuse revokes the entire family and returns refresh_reuse_detected.
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: '#/components/schemas/RefreshRequest' } }
+      responses:
+        '200':
+          description: Rotated key-bound credentials
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/CredentialSet' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /devices:
+    get:
+      tags: [Devices]
+      security: [{ operatorBearerAuth: [] }]
+      operationId: listPairedDevices
+      summary: List paired and revoked companion devices
+      parameters: [{ $ref: '#/components/parameters/PageCursor' }, { $ref: '#/components/parameters/PageLimit' }]
+      responses:
+        '200':
+          description: Paired and revoked devices visible to the operator's independently checked scope/policy
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/DevicePage' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /devices/{deviceId}/keys/rotate:
+    parameters: [{ $ref: '#/components/parameters/DeviceId' }]
+    post:
+      tags: [Devices]
+      security:
+        - deviceAccessToken: []
+          deviceProof: []
+      operationId: rotateDeviceKey
+      summary: Replace a device key without normal re-pairing
+      description: Requires a valid key-bound session, old-key DPoP authorization, and proof by the new key over the canonical rotation challenge. Rotation is atomic and revokes all credentials bound to the old key.
+      parameters: [{ $ref: '#/components/parameters/IdempotencyKey' }]
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: '#/components/schemas/RotateDeviceKeyRequest' } }
+      responses:
+        '200':
+          description: Key rotated and replacement credentials issued
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/RotateDeviceKeyResult' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /devices/{deviceId}/revoke:
+    parameters: [{ $ref: '#/components/parameters/DeviceId' }]
+    post:
+      tags: [Devices]
+      security:
+        - operatorBearerAuth: []
+        - deviceAccessToken: []
+          deviceProof: []
+      operationId: revokeDevice
+      summary: Revoke a paired device and every associated credential/channel
+      parameters: [{ $ref: '#/components/parameters/IdempotencyKey' }]
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: '#/components/schemas/RevokeDeviceRequest' } }
+      responses:
+        '200':
+          description: Revocation applied or already applied
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/RevokeDeviceResult' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /bootstrap:
+    get:
+      tags: [Bootstrap]
+      operationId: getBootstrap
+      summary: Fetch the initial account, device policy, capabilities, and cursors
+      responses:
+        '200':
+          description: Bootstrap state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Bootstrap'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /sessions:
+    get:
+      tags: [Sessions]
+      operationId: listSessions
+      parameters: [{ $ref: '#/components/parameters/PageCursor' }, { $ref: '#/components/parameters/PageLimit' }]
+      responses:
+        '200':
+          description: Chat sessions only; scheduled cron runs are not sessions
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionPage' }
+    post:
+      tags: [Sessions]
+      operationId: createSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateSessionRequest' }
+      responses:
+        '201':
+          description: Session created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Session' }
+  /sessions/{sessionId}:
+    parameters: [{ $ref: '#/components/parameters/SessionId' }]
+    get:
+      tags: [Sessions]
+      operationId: getSession
+      responses:
+        '200':
+          description: Chat session
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/Session' } }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /sessions/{sessionId}/messages:
+    parameters: [{ $ref: '#/components/parameters/SessionId' }]
+    get:
+      tags: [Sessions]
+      operationId: listMessages
+      parameters: [{ $ref: '#/components/parameters/PageCursor' }, { $ref: '#/components/parameters/PageLimit' }]
+      responses:
+        '200':
+          description: Messages in chronological order
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/MessagePage' } }
+    post:
+      tags: [Sessions]
+      operationId: sendMessage
+      parameters: [{ $ref: '#/components/parameters/IdempotencyKey' }]
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: '#/components/schemas/SendMessageRequest' } }
+      responses:
+        '202':
+          description: Message accepted
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/MessageAccepted' } }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /activities:
+    get:
+      tags: [Activities]
+      operationId: listActivities
+      parameters: [{ $ref: '#/components/parameters/PageCursor' }, { $ref: '#/components/parameters/PageLimit' }, { $ref: '#/components/parameters/Sensitivity' }]
+      responses:
+        '200':
+          description: User-visible activity feed
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/ActivityPage' } }
+  /activities/{activityId}:
+    parameters: [{ $ref: '#/components/parameters/ActivityId' }]
+    get:
+      tags: [Activities]
+      operationId: getActivity
+      responses:
+        '200':
+          description: Activity with run tree
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/Activity' } }
+  /activities/{activityId}/runs:
+    parameters: [{ $ref: '#/components/parameters/ActivityId' }]
+    get:
+      tags: [Activities]
+      operationId: listActivityRuns
+      parameters: [{ $ref: '#/components/parameters/PageCursor' }, { $ref: '#/components/parameters/PageLimit' }]
+      responses:
+        '200':
+          description: Agent runs for an activity
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/RunPage' } }
+  /cron/jobs:
+    get:
+      tags: [Cron]
+      operationId: listCronJobs
+      parameters: [{ $ref: '#/components/parameters/PageCursor' }, { $ref: '#/components/parameters/PageLimit' }]
+      responses:
+        '200':
+          description: Scheduled jobs
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/CronJobPage' } }
+  /cron/jobs/{jobId}/runs:
+    parameters: [{ $ref: '#/components/parameters/JobId' }]
+    get:
+      tags: [Cron]
+      operationId: listCronRuns
+      parameters: [{ $ref: '#/components/parameters/PageCursor' }, { $ref: '#/components/parameters/PageLimit' }]
+      responses:
+        '200':
+          description: Cron executions, distinct from chat sessions
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/CronRunPage' } }
+  /runs/{runId}/agents:
+    parameters: [{ $ref: '#/components/parameters/RunId' }]
+    get:
+      tags: [Activities]
+      operationId: listRunAgents
+      summary: List agents participating in a run
+      responses:
+        '200':
+          description: Agents attached to the run
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/RunAgentPage' } }
+  /devices/{deviceId}/policy:
+    parameters: [{ $ref: '#/components/parameters/DeviceId' }]
+    get:
+      tags: [Devices]
+      operationId: getDevicePolicy
+      responses:
+        '200':
+          description: Effective capability policy
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/DeviceCapabilityPolicy' } }
+  /devices/{deviceId}/capabilities:
+    parameters: [{ $ref: '#/components/parameters/DeviceId' }]
+    get:
+      tags: [Devices]
+      operationId: listDeviceCapabilities
+      responses:
+        '200':
+          description: Typed capabilities available on the device
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/DeviceCapabilities' } }
+  /devices/{deviceId}/commands:
+    parameters: [{ $ref: '#/components/parameters/DeviceId' }]
+    post:
+      tags: [Devices]
+      operationId: createDeviceCommand
+      summary: Dispatch an explicitly allowlisted typed command
+      parameters: [{ $ref: '#/components/parameters/IdempotencyKey' }]
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: '#/components/schemas/DeviceCommandRequest' } }
+      responses:
+        '202':
+          description: Command accepted
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/DeviceCommand' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /commands/{commandId}/results:
+    parameters: [{ $ref: '#/components/parameters/CommandId' }]
+    get:
+      tags: [Devices]
+      operationId: getCommandResult
+      summary: Fetch the redacted result of a typed device command
+      responses:
+        '200':
+          description: Command result
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/CommandResult' } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Devices]
+      operationId: submitCommandResult
+      summary: Submit a device-executed typed-command result
+      description: |
+        The paired device uses this endpoint only after executing an accepted,
+        non-expired allowlisted command. Sensitive payloads must be minimized and
+        redacted by the phone before submission; OTPs use `/otp/submit` instead.
+      parameters: [{ $ref: '#/components/parameters/IdempotencyKey' }]
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: '#/components/schemas/CommandResultSubmission' } }
+      responses:
+        '202':
+          description: Result accepted
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/CommandResult' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /otp/submit:
+    post:
+      tags: [Devices]
+      operationId: submitOtp
+      summary: Submit a single-use, destination-bound OTP without chat transport
+      description: OTP codes are secret input and are never returned, logged, or stored in chat messages.
+      security:
+        - deviceAccessToken: []
+          deviceProof: []
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: '#/components/schemas/OtpSubmit' } }
+      responses:
+        '202':
+          description: OTP accepted for the consent session; result is redacted
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/CommandResult' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /events:
+    get:
+      tags: [Events]
+      operationId: streamEvents
+      description: |
+        Cursor-based event stream. The server may replay events (at-least-once).
+        Clients persist cursor after processing and deduplicate by eventId.
+        Unknown eventType values and unknown fields MUST be ignored safely.
+      parameters:
+        - name: cursor
+          in: query
+          description: Resume token; omit to start at the server-defined retention point.
+          schema: { type: string }
+        - name: waitSeconds
+          in: query
+          schema: { type: integer, minimum: 0, maximum: 60, default: 30 }
+      responses:
+        '200':
+          description: Event batch
+          content:
+            application/x-ndjson:
+              schema: { type: string }
+              examples:
+                event:
+                  value: '{"sequence":42,"eventId":"evt_01J...","cursor":"c_42","eventType":"message.created","occurredAt":"2026-01-01T00:00:00Z","data":{}}'
+        '410':
+          description: Cursor expired; perform bootstrap/resync
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/Error' } }
+components:
+  securitySchemes:
+    operatorBearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque-operator-token
+      description: Authenticated local user/control-plane credential; never issued by pairing.
+    deviceAccessToken:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque-device-token
+      description: Short-lived opaque token bound server-side to deviceId, sessionId, keyId, token family, audience companion-api, scopes, expiry, and revocation epoch.
+    deviceProof:
+      type: apiKey
+      in: header
+      name: DPoP
+      x-proofMaxAgeSeconds: 60
+      x-replayCacheRequired: true
+      x-htuCanonicalization: RFC 9449 Section 4.2 target URI without query or fragment, reconstructed only from the trusted externally visible scheme/authority/path; untrusted forwarding headers are ignored.
+      x-athInput: Unpadded base64url SHA-256 of the ASCII bytes of the exact presented access token, or the exact refresh token on POST /auth/refresh.
+      description: RFC 9449 proof JWT using ES256 and the registered P-256 key. Required claims are unique jti, uppercase htm, canonical htu, iat, and ath; its JWK must encode the same public key as the registered SPKI/keyId. The server rejects replay, stale iat, URI/method mismatch, token-hash mismatch, and keyId mismatch before authorization.
+  parameters:
+    SessionId: { name: sessionId, in: path, required: true, schema: { $ref: '#/components/schemas/PublicId' } }
+    ActivityId: { name: activityId, in: path, required: true, schema: { $ref: '#/components/schemas/PublicId' } }
+    JobId: { name: jobId, in: path, required: true, schema: { $ref: '#/components/schemas/PublicId' } }
+    DeviceId: { name: deviceId, in: path, required: true, schema: { $ref: '#/components/schemas/PublicId' } }
+    RunId: { name: runId, in: path, required: true, schema: { $ref: '#/components/schemas/PublicId' } }
+    CommandId: { name: commandId, in: path, required: true, schema: { $ref: '#/components/schemas/PublicId' } }
+    PageCursor: { name: cursor, in: query, schema: { type: string }, description: Opaque pagination cursor }
+    PageLimit: { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+    IdempotencyKey: { name: Idempotency-Key, in: header, required: true, schema: { type: string, minLength: 8, maxLength: 128 } }
+    Sensitivity: { name: sensitivity, in: query, schema: { $ref: '#/components/schemas/SensitivityLabel' } }
+  responses:
+    BadRequest: { description: Invalid request, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Unauthorized: { description: 'Missing, expired, revoked, unbound, or invalid authentication/proof', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Forbidden: { description: Authenticated principal lacks the required scope or policy grant, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    NotFound: { description: Resource not found, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Conflict: { description: 'Idempotency, replay, token reuse, or state conflict', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    UpgradeRequired: { description: The obsolete code-only pairing shape is rejected; client must implement pairing-proof-1, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  schemas:
+    PublicId:
+      type: string
+      pattern: '^[a-z][a-z0-9_]{2,63}$'
+      description: Stable opaque public identifier; never a gateway routing key.
+    Timestamp: { type: string, format: date-time }
+    SensitivityLabel: { type: string, enum: [public, private, sensitive, highly_sensitive] }
+    PairingInvitationRequest:
+      type: object
+      required: [deviceName]
+      additionalProperties: false
+      properties:
+        deviceName: { type: string, minLength: 1, maxLength: 100, description: Display label only; never an authorization input. }
+    Base64Url:
+      type: string
+      pattern: '^[A-Za-z0-9_-]+$'
+      description: RFC 4648 base64url without `=` padding.
+    CanonicalGatewayOrigin:
+      type: string
+      format: uri
+      pattern: '^https://[^/?#]+$'
+      x-canonicalization: RFC 6454 ASCII origin serialization restricted to HTTPS. Lowercase scheme/host, IDNA A-label host, bracketed lowercase IPv6, omit port 443, include a non-default port, and reject userinfo/path/query/fragment/trailing slash rather than normalize it.
+    KeyId:
+      type: string
+      pattern: '^pk_[A-Za-z0-9_-]{43}$'
+      description: '`pk_` plus unpadded base64url SHA-256 of the exact DER SubjectPublicKeyInfo bytes. The server recomputes and compares it.'
+    DevicePublicKey:
+      type: object
+      required: [keyId, algorithm, encoding, material]
+      additionalProperties: false
+      properties:
+        keyId: { $ref: '#/components/schemas/KeyId' }
+        algorithm: { type: string, const: ES256, description: ECDSA using NIST P-256 and SHA-256. }
+        encoding: { type: string, const: spki-der-base64url }
+        material: { allOf: [{ $ref: '#/components/schemas/Base64Url' }], minLength: 80, maxLength: 256, description: DER X.509 SubjectPublicKeyInfo bytes encoded as unpadded base64url. }
+        androidKeystoreApiFloor: { type: integer, const: 23, description: Pairing requires Android KeyGenParameterSpec/Android Keystore EC signing support from API 23. }
+    PairingRedeemRequest:
+      type: object
+      required: [protocolRevision, invitationId, invitationCode, gatewayOrigin, deviceName, devicePublicKey, clientNonce, proof]
+      additionalProperties: false
+      properties:
+        protocolRevision: { type: string, const: pairing-proof-1 }
+        invitationId: { $ref: '#/components/schemas/PublicId' }
+        invitationCode: { type: string, minLength: 43, maxLength: 128, writeOnly: true, pattern: '^[A-Za-z0-9_-]+$', description: At least 256 bits of random entropy; single-use and never logged. }
+        gatewayOrigin: { $ref: '#/components/schemas/CanonicalGatewayOrigin' }
+        deviceName: { type: string, minLength: 1, maxLength: 100, description: NFC-normalized Unicode string included verbatim in the canonical challenge. }
+        devicePublicKey: { $ref: '#/components/schemas/DevicePublicKey' }
+        clientNonce: { allOf: [{ $ref: '#/components/schemas/Base64Url' }], minLength: 22, maxLength: 64, description: At least 128 random bits; replay-cached through invitation expiry. }
+        proof: { $ref: '#/components/schemas/PairingProof' }
+    EcdsaDerProof:
+      type: object
+      required: [algorithm, signatureFormat, signature]
+      additionalProperties: false
+      properties:
+        algorithm: { type: string, const: ES256 }
+        signatureFormat: { type: string, const: asn1-der-base64url, description: 'Android SHA256withECDSA DER SEQUENCE(r,s), not JOSE raw r||s.' }
+        signature: { allOf: [{ $ref: '#/components/schemas/Base64Url' }], minLength: 80, maxLength: 128 }
+    PairingProof:
+      allOf: [{ $ref: '#/components/schemas/EcdsaDerProof' }]
+      description: |
+        Verify over UTF-8 bytes of `HERMES-COMPANION-PAIRING-V1\u0000` followed by
+        RFC 8785 JCS of an object containing only these string fields:
+        `clientNonce`, `deviceName`, `gatewayOrigin`, `invitationCode`,
+        `invitationId`, `keyId`, `protocolRevision`, and `publicKey` (the exact
+        base64url SPKI material). Reject duplicate JSON names, non-NFC deviceName,
+        unknown challenge fields, invalid keyId derivation, stale/used invitation,
+        nonce replay, or a signature that is not minimal ASN.1 DER.
+    PairingInvitation:
+      type: object
+      x-minEntropyBits: 256
+      x-maxTtlSeconds: 300
+      required: [protocolRevision, invitationId, invitationCode, gatewayOrigin, expiresAt]
+      additionalProperties: false
+      properties:
+        protocolRevision: { type: string, const: pairing-proof-1 }
+        invitationId: { $ref: '#/components/schemas/PublicId' }
+        invitationCode: { type: string, minLength: 43, x-sensitive: true, description: 256-bit single-use secret encoded as unpadded base64url; never logged or persisted unhashed. }
+        gatewayOrigin: { $ref: '#/components/schemas/CanonicalGatewayOrigin' }
+        expiresAt: { $ref: '#/components/schemas/Timestamp' }
+    PairingResult:
+      type: object
+      required: [device, credentials]
+      additionalProperties: false
+      properties:
+        device: { $ref: '#/components/schemas/Device' }
+        credentials: { $ref: '#/components/schemas/CredentialSet' }
+    CredentialSet:
+      type: object
+      x-accessTokenMaxTtlSeconds: 900
+      x-refreshTokenMaxTtlSeconds: 2592000
+      required: [tokenType, accessToken, accessExpiresAt, refreshToken, refreshExpiresAt, deviceId, keyId, sessionId, revocationEpoch]
+      additionalProperties: false
+      properties:
+        tokenType: { type: string, const: DPoP }
+        accessToken: { type: string, minLength: 32, x-sensitive: true }
+        accessExpiresAt: { $ref: '#/components/schemas/Timestamp' }
+        refreshToken: { type: string, minLength: 43, x-sensitive: true, description: Opaque single-use token stored server-side only as a hash and bound to the device key/token family. }
+        refreshExpiresAt: { $ref: '#/components/schemas/Timestamp' }
+        deviceId: { $ref: '#/components/schemas/PublicId' }
+        keyId: { $ref: '#/components/schemas/KeyId' }
+        sessionId: { $ref: '#/components/schemas/PublicId' }
+        revocationEpoch: { type: integer, format: int64, minimum: 0 }
+    RefreshRequest:
+      type: object
+      required: [refreshToken]
+      additionalProperties: false
+      properties:
+        refreshToken: { type: string, minLength: 43, writeOnly: true }
+    RotateDeviceKeyRequest:
+      type: object
+      required: [protocolRevision, currentKeyId, newDevicePublicKey, clientNonce, issuedAt, newKeyProof]
+      additionalProperties: false
+      properties:
+        protocolRevision: { type: string, const: pairing-proof-1 }
+        currentKeyId: { $ref: '#/components/schemas/KeyId' }
+        newDevicePublicKey: { $ref: '#/components/schemas/DevicePublicKey' }
+        clientNonce: { allOf: [{ $ref: '#/components/schemas/Base64Url' }], minLength: 22, maxLength: 64 }
+        issuedAt: { $ref: '#/components/schemas/Timestamp' }
+        newKeyProof: { $ref: '#/components/schemas/RotationProof' }
+    RotationProof:
+      allOf: [{ $ref: '#/components/schemas/EcdsaDerProof' }]
+      description: Verify the new key over UTF-8 `HERMES-COMPANION-ROTATE-V1\u0000` plus RFC 8785 JCS of the string fields clientNonce, currentKeyId, deviceId, issuedAt, newKeyId, newPublicKey, and protocolRevision. The old key separately authorizes the HTTP request through DPoP. Accept at most five minutes of clock skew and replay-cache clientNonce.
+    RotateDeviceKeyResult:
+      type: object
+      required: [device, credentials, previousKeyRevokedAt]
+      additionalProperties: false
+      properties:
+        device: { $ref: '#/components/schemas/Device' }
+        credentials: { $ref: '#/components/schemas/CredentialSet' }
+        previousKeyRevokedAt: { $ref: '#/components/schemas/Timestamp' }
+    RevokeDeviceRequest:
+      type: object
+      required: [reason]
+      additionalProperties: false
+      properties:
+        reason: { type: string, enum: [user_requested, device_lost, suspected_compromise, key_replaced, administrative] }
+    RevokeDeviceResult:
+      type: object
+      required: [deviceId, status, revokedAt, revocationEpoch, effects]
+      additionalProperties: false
+      properties:
+        deviceId: { $ref: '#/components/schemas/PublicId' }
+        status: { type: string, const: revoked }
+        revokedAt: { $ref: '#/components/schemas/Timestamp' }
+        revocationEpoch: { type: integer, format: int64, minimum: 1 }
+        effects: { $ref: '#/components/schemas/RevocationEffects' }
+    RevocationEffects:
+      type: object
+      required: [restDenied, refreshDenied, webSocketsClosed, pendingDeliveryCanceled, localEraseRequired]
+      additionalProperties: false
+      properties:
+        restDenied: { type: boolean, const: true }
+        refreshDenied: { type: boolean, const: true }
+        webSocketsClosed: { type: boolean, const: true, description: 'Active sockets close promptly with code 4401/device_revoked, not merely at token expiry.' }
+        pendingDeliveryCanceled: { type: boolean, const: true }
+        localEraseRequired: { type: boolean, const: true, description: 'On next contact the phone deletes pairing key, credentials, grants, sensitive queues, and cached responses.' }
+    Bootstrap:
+      type: object
+      required: [contractVersion, protocolRevision, device, authentication, policy, capabilities, eventCursor]
+      properties:
+        contractVersion: { type: string, const: companion-v1 }
+        protocolRevision: { type: string, const: pairing-proof-1 }
+        device: { $ref: '#/components/schemas/Device' }
+        authentication: { $ref: '#/components/schemas/BootstrapAuthentication' }
+        policy: { $ref: '#/components/schemas/DeviceCapabilityPolicy' }
+        capabilities: { type: array, items: { $ref: '#/components/schemas/Capability' } }
+        eventCursor: { type: string }
+    BootstrapAuthentication:
+      type: object
+      required: [tokenType, proofAlgorithm, keyId, accessExpiresAt, refreshExpiresAt, revocationEpoch]
+      additionalProperties: false
+      properties:
+        tokenType: { type: string, const: DPoP }
+        proofAlgorithm: { type: string, const: ES256 }
+        keyId: { $ref: '#/components/schemas/KeyId' }
+        accessExpiresAt: { $ref: '#/components/schemas/Timestamp' }
+        refreshExpiresAt: { $ref: '#/components/schemas/Timestamp' }
+        revocationEpoch: { type: integer, format: int64, minimum: 0 }
+      description: Confirms the bootstrap response and refresh family are bound to this exact registered key. No token value is repeated in bootstrap.
+    Device:
+      type: object
+      required: [id, name, platform, status, keyId, pairedAt, revocationEpoch]
+      properties:
+        id: { $ref: '#/components/schemas/PublicId' }
+        name: { type: string }
+        platform: { type: string, enum: [android] }
+        appVersion: { type: string }
+        status: { type: string, enum: [paired, revoked] }
+        keyId: { $ref: '#/components/schemas/KeyId' }
+        pairedAt: { $ref: '#/components/schemas/Timestamp' }
+        revokedAt: { $ref: '#/components/schemas/Timestamp' }
+        revocationEpoch: { type: integer, format: int64, minimum: 0 }
+    DevicePage:
+      allOf: [{ $ref: '#/components/schemas/PageInfo' }, { type: object, required: [items], properties: { items: { type: array, items: { $ref: '#/components/schemas/Device' } } } }]
+    Capability:
+      type: object
+      required: [name, state]
+      properties:
+        name: { type: string, enum: [notifications, camera, microphone, location, contacts, calendar, clipboard] }
+        state: { type: string, enum: [allowed, denied, unavailable, requires_consent] }
+    DeviceCapabilityPolicy:
+      type: object
+      required: [deviceId, capabilities, updatedAt]
+      properties:
+        deviceId: { $ref: '#/components/schemas/PublicId' }
+        capabilities: { type: array, items: { $ref: '#/components/schemas/CapabilityPolicyEntry' } }
+        updatedAt: { $ref: '#/components/schemas/Timestamp' }
+    CapabilityPolicyEntry:
+      allOf:
+        - $ref: '#/components/schemas/Capability'
+        - type: object
+          properties: { allowBackgroundUse: { type: boolean, default: false } }
+    DeviceCapabilities:
+      type: object
+      required: [deviceId, capabilities, commands]
+      properties:
+        deviceId: { $ref: '#/components/schemas/PublicId' }
+        capabilities: { type: array, items: { $ref: '#/components/schemas/Capability' } }
+        commands: { type: array, items: { $ref: '#/components/schemas/TypedCommandType' } }
+    TypedCommandType:
+      type: string
+      enum: [location.capture_once, location.share_session.start, location.share_session.stop, device_stats.snapshot, health.aggregate, otp.consent_session.start, notification.display]
+    CreateSessionRequest:
+      type: object
+      required: [title]
+      properties: { title: { type: string, maxLength: 200 }, sensitivity: { $ref: '#/components/schemas/SensitivityLabel' } }
+    SendMessageRequest:
+      type: object
+      required: [clientMessageId, content]
+      properties:
+        clientMessageId: { type: string, minLength: 1, maxLength: 128 }
+        content: { type: string, minLength: 1, maxLength: 100000 }
+        sensitivity: { $ref: '#/components/schemas/SensitivityLabel' }
+    MessageAccepted:
+      type: object
+      required: [messageId, sessionId, status]
+      properties:
+        messageId: { $ref: '#/components/schemas/PublicId' }
+        sessionId: { $ref: '#/components/schemas/PublicId' }
+        status: { type: string, enum: [accepted, duplicate] }
+    Session:
+      type: object
+      required: [id, title, createdAt, updatedAt]
+      properties:
+        id: { $ref: '#/components/schemas/PublicId' }
+        title: { type: string }
+        sensitivity: { $ref: '#/components/schemas/SensitivityLabel' }
+        createdAt: { $ref: '#/components/schemas/Timestamp' }
+        updatedAt: { $ref: '#/components/schemas/Timestamp' }
+    Message:
+      type: object
+      required: [id, sessionId, role, content, createdAt]
+      properties:
+        id: { $ref: '#/components/schemas/PublicId' }
+        sessionId: { $ref: '#/components/schemas/PublicId' }
+        role: { type: string, enum: [user, assistant, system] }
+        content: { type: string }
+        sensitivity: { $ref: '#/components/schemas/SensitivityLabel' }
+        createdAt: { $ref: '#/components/schemas/Timestamp' }
+    Activity:
+      type: object
+      required: [id, kind, status, createdAt]
+      properties:
+        id: { $ref: '#/components/schemas/PublicId' }
+        kind: { type: string, enum: [chat, task, notification] }
+        status: { type: string, enum: [queued, running, succeeded, failed, canceled] }
+        runTree: { type: array, items: { $ref: '#/components/schemas/Run' } }
+        createdAt: { $ref: '#/components/schemas/Timestamp' }
+    Run:
+      type: object
+      required: [id, activityId, status, startedAt]
+      properties:
+        id: { $ref: '#/components/schemas/PublicId' }
+        activityId: { $ref: '#/components/schemas/PublicId' }
+        parentRunId: { $ref: '#/components/schemas/PublicId' }
+        status: { type: string, enum: [queued, running, succeeded, failed, canceled] }
+        agent: { type: string, description: 'Public agent name, not a routing key' }
+        command: { $ref: '#/components/schemas/TypedCommand' }
+        result: { $ref: '#/components/schemas/TypedResult' }
+        snapshot: { $ref: '#/components/schemas/Snapshot' }
+        startedAt: { $ref: '#/components/schemas/Timestamp' }
+        finishedAt: { $ref: '#/components/schemas/Timestamp' }
+    TypedCommand:
+      type: object
+      required: [type, input]
+      additionalProperties: false
+      properties:
+        type: { $ref: '#/components/schemas/TypedCommandType' }
+        input: { type: object, additionalProperties: true }
+    DeviceCommandRequest:
+      allOf:
+        - $ref: '#/components/schemas/TypedCommand'
+        - type: object
+          required: [expiresAt]
+          properties:
+            expiresAt: { $ref: '#/components/schemas/Timestamp' }
+    DeviceCommand:
+      type: object
+      required: [commandId, deviceId, command, status, createdAt]
+      properties:
+        commandId: { $ref: '#/components/schemas/PublicId' }
+        deviceId: { $ref: '#/components/schemas/PublicId' }
+        command: { $ref: '#/components/schemas/TypedCommand' }
+        status: { type: string, enum: [queued, running, succeeded, failed, expired, consumed] }
+        createdAt: { $ref: '#/components/schemas/Timestamp' }
+        expiresAt: { $ref: '#/components/schemas/Timestamp' }
+    CommandResult:
+      type: object
+      required: [commandId, type, status, completedAt, redacted]
+      properties:
+        commandId: { $ref: '#/components/schemas/PublicId' }
+        type: { $ref: '#/components/schemas/TypedCommandType' }
+        status: { type: string, enum: [pending, succeeded, failed, expired, consumed] }
+        completedAt: { $ref: '#/components/schemas/Timestamp' }
+        redacted: { type: boolean, const: true }
+        output: { type: object, additionalProperties: true }
+    CommandResultSubmission:
+      type: object
+      required: [type, status, completedAt, redacted]
+      additionalProperties: false
+      properties:
+        type: { $ref: '#/components/schemas/TypedCommandType' }
+        status: { type: string, enum: [succeeded, failed, expired, consumed] }
+        completedAt: { $ref: '#/components/schemas/Timestamp' }
+        redacted: { type: boolean, const: true }
+        output: { type: object, additionalProperties: true, description: 'Redacted, capability-specific output only; never an OTP, raw SMS, token, or unrestricted device data.' }
+    OtpSubmit:
+      type: object
+      required: [type, consentSessionId, destination, code, expiresAt, singleUse]
+      additionalProperties: false
+      properties:
+        type: { type: string, const: otp.submit }
+        consentSessionId: { $ref: '#/components/schemas/PublicId' }
+        destination: { type: string, minLength: 1, maxLength: 200, description: Bound destination identifier; never a chat target }
+        code: { type: string, minLength: 1, maxLength: 32, writeOnly: true, description: 'Secret OTP; must never be returned, logged, or placed in chat messages' }
+        expiresAt: { $ref: '#/components/schemas/Timestamp' }
+        singleUse: { type: boolean, const: true }
+    RunAgent:
+      type: object
+      required: [agent, status]
+      properties:
+        agent: { type: string }
+        status: { type: string, enum: [queued, running, succeeded, failed, canceled] }
+    RunAgentPage:
+      allOf: [{ $ref: '#/components/schemas/PageInfo' }, { type: object, required: [items], properties: { items: { type: array, items: { $ref: '#/components/schemas/RunAgent' } } } }]
+    TypedResult:
+      type: object
+      required: [type, output]
+      properties:
+        type: { type: string, enum: [acknowledged, notification_shown, snapshot_created, consent_requested, failure] }
+        output: { type: object, additionalProperties: true }
+    Snapshot:
+      type: object
+      required: [id, kind, createdAt]
+      properties:
+        id: { $ref: '#/components/schemas/PublicId' }
+        kind: { type: string, enum: [screen, state, activity] }
+        uri: { type: string, format: uri }
+        contentType: { type: string }
+        sensitivity: { $ref: '#/components/schemas/SensitivityLabel' }
+        createdAt: { $ref: '#/components/schemas/Timestamp' }
+    CronJob:
+      type: object
+      required: [id, name, schedule, enabled]
+      properties:
+        id: { $ref: '#/components/schemas/PublicId' }
+        name: { type: string }
+        schedule: { type: string, description: Server-validated cron expression }
+        enabled: { type: boolean }
+    CronRun:
+      type: object
+      required: [id, jobId, status, startedAt]
+      properties:
+        id: { $ref: '#/components/schemas/PublicId' }
+        jobId: { $ref: '#/components/schemas/PublicId' }
+        status: { type: string, enum: [queued, running, succeeded, failed, canceled] }
+        activityId: { $ref: '#/components/schemas/PublicId' }
+        startedAt: { $ref: '#/components/schemas/Timestamp' }
+        finishedAt: { $ref: '#/components/schemas/Timestamp' }
+    EventEnvelope:
+      type: object
+      required: [sequence, eventId, cursor, eventType, occurredAt, data]
+      properties:
+        sequence: { type: integer, format: int64, minimum: 0 }
+        eventId: { $ref: '#/components/schemas/PublicId' }
+        cursor: { type: string }
+        eventType: { type: string, description: Unknown values are forward-compatible and must be ignored. }
+        occurredAt: { $ref: '#/components/schemas/Timestamp' }
+        sensitivity: { $ref: '#/components/schemas/SensitivityLabel' }
+        data: { type: object, additionalProperties: true }
+    PageInfo:
+      type: object
+      required: [hasMore]
+      properties:
+        hasMore: { type: boolean }
+        nextCursor: { type: string }
+    SessionPage: { allOf: [{ $ref: '#/components/schemas/PageInfo' }, { type: object, required: [items], properties: { items: { type: array, items: { $ref: '#/components/schemas/Session' } } } }] }
+    MessagePage: { allOf: [{ $ref: '#/components/schemas/PageInfo' }, { type: object, required: [items], properties: { items: { type: array, items: { $ref: '#/components/schemas/Message' } } } }] }
+    ActivityPage: { allOf: [{ $ref: '#/components/schemas/PageInfo' }, { type: object, required: [items], properties: { items: { type: array, items: { $ref: '#/components/schemas/Activity' } } } }] }
+    RunPage: { allOf: [{ $ref: '#/components/schemas/PageInfo' }, { type: object, required: [items], properties: { items: { type: array, items: { $ref: '#/components/schemas/Run' } } } }] }
+    CronJobPage: { allOf: [{ $ref: '#/components/schemas/PageInfo' }, { type: object, required: [items], properties: { items: { type: array, items: { $ref: '#/components/schemas/CronJob' } } } }] }
+    CronRunPage: { allOf: [{ $ref: '#/components/schemas/PageInfo' }, { type: object, required: [items], properties: { items: { type: array, items: { $ref: '#/components/schemas/CronRun' } } } }] }
+    Error:
+      type: object
+      required: [code, message, retryable]
+      additionalProperties: false
+      properties:
+        code:
+          type: string
+          enum: [invalid_request, invalid_invitation, invitation_expired, invitation_consumed, invalid_key, invalid_signature, replay_detected, invalid_token, proof_required, proof_invalid, device_revoked, session_revoked, refresh_reuse_detected, key_rotation_required, pairing_protocol_upgrade_required, forbidden, not_found, conflict, cursor_expired, rate_limited]
+          description: Stable machine code. Authentication errors do not reveal which secret/proof component failed.
+        message: { type: string, description: 'Human-safe text with no invitation, key, signature, token, OTP, location, health, or routing-key material.' }
+        retryable: { type: boolean }
+        correlationId: { $ref: '#/components/schemas/PublicId' }
+        details: { type: object, additionalProperties: true, description: Optional non-secret structured metadata; clients ignore unknown fields. }
+      description: Revoked REST and refresh requests return HTTP 401 with device_revoked or session_revoked. Replay/token-reuse state conflicts return HTTP 409. Obsolete pairing shape returns HTTP 426 with pairing_protocol_upgrade_required.

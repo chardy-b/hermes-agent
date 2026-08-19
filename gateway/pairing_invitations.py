@@ -3,6 +3,7 @@
 This module owns protocol validation and profile-scoped persistence.  HTTP
 routing and operator authentication stay in the API-server adapter.
 """
+
 from __future__ import annotations
 
 import base64
@@ -34,67 +35,59 @@ PROTOCOL_REVISION = "pairing-proof-1"
 CONTRACT_VERSION = "companion-v1"
 PAIRING_CONTEXT = b"HERMES-COMPANION-PAIRING-V1\0"
 ROTATION_CONTEXT = b"HERMES-COMPANION-ROTATE-V1\0"
-PAIRING_FIELDS = frozenset(
-    {
-        "clientNonce",
-        "deviceName",
-        "gatewayOrigin",
-        "invitationCode",
-        "invitationId",
-        "keyId",
-        "protocolRevision",
-        "publicKey",
-    }
-)
-PAIRING_REQUEST_FIELDS = frozenset(
-    {
-        "protocolRevision",
-        "invitationId",
-        "invitationCode",
-        "gatewayOrigin",
-        "deviceName",
-        "devicePublicKey",
-        "clientNonce",
-        "proof",
-    }
-)
-DEVICE_KEY_FIELDS = frozenset(
-    {"keyId", "algorithm", "encoding", "material", "androidKeystoreApiFloor"}
-)
+PAIRING_FIELDS = frozenset({
+    "clientNonce",
+    "deviceName",
+    "gatewayOrigin",
+    "invitationCode",
+    "invitationId",
+    "keyId",
+    "protocolRevision",
+    "publicKey",
+})
+PAIRING_REQUEST_FIELDS = frozenset({
+    "protocolRevision",
+    "invitationId",
+    "invitationCode",
+    "gatewayOrigin",
+    "deviceName",
+    "devicePublicKey",
+    "clientNonce",
+    "proof",
+})
+DEVICE_KEY_FIELDS = frozenset({
+    "keyId",
+    "algorithm",
+    "encoding",
+    "material",
+    "androidKeystoreApiFloor",
+})
 PROOF_FIELDS = frozenset({"algorithm", "signatureFormat", "signature"})
-ROTATION_FIELDS = frozenset(
-    {
-        "clientNonce",
-        "currentKeyId",
-        "deviceId",
-        "issuedAt",
-        "newKeyId",
-        "newPublicKey",
-        "protocolRevision",
-    }
-)
-ROTATION_REQUEST_FIELDS = frozenset(
-    {
-        "protocolRevision",
-        "currentKeyId",
-        "newDevicePublicKey",
-        "clientNonce",
-        "issuedAt",
-        "newKeyProof",
-    }
-)
-REVOCATION_REASONS = frozenset(
-    {
-        "user_requested",
-        "device_lost",
-        "suspected_compromise",
-        "key_replaced",
-        "administrative",
-    }
-)
-P256_ORDER = int(
-    "FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551", 16
-)
+ROTATION_FIELDS = frozenset({
+    "clientNonce",
+    "currentKeyId",
+    "deviceId",
+    "issuedAt",
+    "newKeyId",
+    "newPublicKey",
+    "protocolRevision",
+})
+ROTATION_REQUEST_FIELDS = frozenset({
+    "protocolRevision",
+    "currentKeyId",
+    "newDevicePublicKey",
+    "clientNonce",
+    "issuedAt",
+    "newKeyProof",
+})
+REVOCATION_REASONS = frozenset({
+    "user_requested",
+    "device_lost",
+    "suspected_compromise",
+    "key_replaced",
+    "administrative",
+})
+P256_ORDER = int("FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551", 16)
 PUBLIC_ID_RE = re.compile(r"^[a-z][a-z0-9_]{2,63}$")
 KEY_ID_RE = re.compile(r"^pk_[A-Za-z0-9_-]{43}$")
 B64URL_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -106,6 +99,10 @@ REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60
 MAX_INVITATION_TTL_SECONDS = 300
 DPOP_MAX_AGE_SECONDS = 60
 DPOP_FUTURE_SKEW_SECONDS = 5
+# Replays are guaranteed for 24 hours. After expiry the key is fresh; the
+# underlying single-use/resource-state rules still prevent replaying a consumed
+# invitation or undoing a revocation.
+IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60
 
 
 class PairingError(Exception):
@@ -217,6 +214,84 @@ def _refresh_idempotency_id(
     return hmac.new(derivation_key, context, hashlib.sha256).digest()
 
 
+def _operation_idempotency_id(
+    derivation_key: bytes,
+    operation: str,
+    actor_binding: str,
+    idempotency_key: str,
+) -> bytes:
+    """Derive a scoped durable lookup without persisting caller-chosen keys."""
+    context = b"\0".join((
+        b"HERMES-COMPANION-OPERATION-IDEMPOTENCY-V1",
+        operation.encode("utf-8"),
+        actor_binding.encode("utf-8"),
+        idempotency_key.encode("ascii"),
+    ))
+    return hmac.new(derivation_key, context, hashlib.sha256).digest()
+
+
+def _derive_operation_secret(
+    derivation_key: bytes, idempotency_id: bytes, purpose: bytes
+) -> str:
+    return _encode_base64url(
+        hmac.new(
+            derivation_key,
+            b"HERMES-COMPANION-OPERATION-RESULT-V1\0"
+            + purpose
+            + b"\0"
+            + idempotency_id,
+            hashlib.sha256,
+        ).digest()
+    )
+
+
+def _derive_public_id(prefix: str, idempotency_id: bytes, purpose: bytes) -> str:
+    digest = hashlib.sha256(purpose + b"\0" + idempotency_id).hexdigest()
+    return prefix + digest[:32]
+
+
+def _encode_page_cursor(resource: str, key: list[Any], signing_key: bytes) -> str:
+    payload = json.dumps(
+        {"v": 1, "r": resource, "k": key},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    signature = hmac.new(signing_key, payload, hashlib.sha256).digest()
+    return f"{_encode_base64url(payload)}.{_encode_base64url(signature)}"
+
+
+def _decode_page_cursor(resource: str, cursor: str, signing_key: bytes) -> list[Any]:
+    if not isinstance(cursor, str) or not 1 <= len(cursor) <= 1024:
+        raise PairingError("invalid_request")
+    parts = cursor.split(".")
+    if len(parts) != 2:
+        raise PairingError("invalid_request")
+    payload = _decode_base64url(parts[0])
+    signature = _decode_base64url(parts[1])
+    if (
+        _encode_base64url(payload) != parts[0]
+        or _encode_base64url(signature) != parts[1]
+        or not hmac.compare_digest(
+            signature, hmac.new(signing_key, payload, hashlib.sha256).digest()
+        )
+    ):
+        raise PairingError("invalid_request")
+    try:
+        value = json.loads(payload.decode("utf-8"))
+    except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise PairingError("invalid_request") from exc
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"v", "r", "k"}
+        or value["v"] != 1
+        or value["r"] != resource
+        or not isinstance(value["k"], list)
+        or len(value["k"]) != 2
+    ):
+        raise PairingError("invalid_request")
+    return value["k"]
+
+
 def _derive_rotation_tokens(
     derivation_key: bytes, session_id: str, idempotency_key: str
 ) -> tuple[str, str]:
@@ -265,9 +340,7 @@ def _decode_base64url(value: Any, *, error: str = "invalid_request") -> bytes:
 
 def _timestamp(value: float) -> str:
     return (
-        datetime.fromtimestamp(value, timezone.utc)
-        .isoformat()
-        .replace("+00:00", "Z")
+        datetime.fromtimestamp(value, timezone.utc).isoformat().replace("+00:00", "Z")
     )
 
 
@@ -428,11 +501,7 @@ def _validate_der_signature(signature: bytes) -> None:
             not integer
             or len(integer) > 33
             or integer[0] & 0x80
-            or (
-                len(integer) > 1
-                and integer[0] == 0
-                and not integer[1] & 0x80
-            )
+            or (len(integer) > 1 and integer[0] == 0 and not integer[1] & 0x80)
         ):
             raise PairingError("invalid_signature")
         values.append(int.from_bytes(integer, "big"))
@@ -535,7 +604,10 @@ def _rotation_proof_inputs(
         raise PairingError("pairing_protocol_upgrade_required")
     device_id = _validate_public_id(device_id)
     current_key_id = payload.get("currentKeyId")
-    if not isinstance(current_key_id, str) or KEY_ID_RE.fullmatch(current_key_id) is None:
+    if (
+        not isinstance(current_key_id, str)
+        or KEY_ID_RE.fullmatch(current_key_id) is None
+    ):
         raise PairingError("invalid_key")
 
     new_device_key = payload.get("newDevicePublicKey")
@@ -559,10 +631,9 @@ def _rotation_proof_inputs(
         raise PairingError("invalid_key")
     new_spki, new_public_key = _load_p256_spki(material)
     new_key_id = derive_key_id(new_spki)
-    if (
-        not hmac.compare_digest(str(new_device_key.get("keyId", "")), new_key_id)
-        or hmac.compare_digest(current_key_id, new_key_id)
-    ):
+    if not hmac.compare_digest(
+        str(new_device_key.get("keyId", "")), new_key_id
+    ) or hmac.compare_digest(current_key_id, new_key_id):
         raise PairingError("invalid_key")
 
     client_nonce = payload.get("clientNonce")
@@ -584,9 +655,7 @@ def _rotation_proof_inputs(
         or proof.get("signatureFormat") != "asn1-der-base64url"
     ):
         raise PairingError("invalid_signature")
-    signature = _decode_base64url(
-        proof.get("signature"), error="invalid_signature"
-    )
+    signature = _decode_base64url(proof.get("signature"), error="invalid_signature")
     _validate_der_signature(signature)
     fields = {
         "clientNonce": client_nonce,
@@ -610,8 +679,8 @@ def _rotation_proof_inputs(
 
 def verify_pairing_proof(payload: dict[str, Any]) -> str:
     """Verify a contract request without consulting invitation state."""
-    _invitation_id, _code, _spki, key_id, _key, _challenge = (
-        _pairing_proof_inputs(payload)
+    _invitation_id, _code, _spki, key_id, _key, _challenge = _pairing_proof_inputs(
+        payload
     )
     return key_id
 
@@ -628,10 +697,10 @@ class PairingInvitationStore:
         clock=time.time,
     ):
         self.gateway_origin = canonical_gateway_origin(gateway_origin)
-        self.ttl_seconds = min(
-            MAX_INVITATION_TTL_SECONDS, max(1, int(ttl_seconds))
+        self.ttl_seconds = min(MAX_INVITATION_TTL_SECONDS, max(1, int(ttl_seconds)))
+        self.db_path = (
+            Path(db_path) if db_path is not None else get_hermes_home() / "state.db"
         )
-        self.db_path = Path(db_path) if db_path is not None else get_hermes_home() / "state.db"
         self.clock = clock
         self._initialize_schema()
 
@@ -768,6 +837,14 @@ class PairingInvitationStore:
                     previous_key_revoked_at REAL NOT NULL,
                     expires_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS companion_operation_idempotency (
+                    idempotency_id BLOB PRIMARY KEY,
+                    operation TEXT NOT NULL,
+                    request_fingerprint TEXT NOT NULL,
+                    result_metadata_json TEXT NOT NULL,
+                    committed_at REAL NOT NULL,
+                    expires_at REAL NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS companion_audit (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     occurred_at REAL NOT NULL,
@@ -815,7 +892,104 @@ class PairingInvitationStore:
                 outcome=outcome,
             )
 
-    def create_invitation(self, actor: str, device_name: Any) -> PairingInvitation:
+    @staticmethod
+    def _validate_idempotency_inputs(
+        idempotency_key: Any,
+        request_fingerprint: Any,
+        derivation_key: Any,
+    ) -> tuple[str, str, bytes]:
+        if (
+            not isinstance(idempotency_key, str)
+            or not 8 <= len(idempotency_key) <= 128
+            or not idempotency_key.isascii()
+            or not isinstance(request_fingerprint, str)
+            or len(request_fingerprint) != 64
+            or not isinstance(derivation_key, bytes)
+            or len(derivation_key) < 16
+        ):
+            raise PairingError("invalid_request")
+        return idempotency_key, request_fingerprint, derivation_key
+
+    def _load_operation_result(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        idempotency_id: bytes,
+        operation: str,
+        request_fingerprint: str,
+        now: float,
+    ) -> dict[str, Any] | None:
+        """Return a committed result or claim absence inside the write txn.
+
+        ``BEGIN IMMEDIATE`` makes one transaction the owner for a duplicate
+        in-flight key. Other processes wait at SQLite (not on a process-global
+        asyncio lock), then observe its committed result. If the owner dies,
+        SQLite rolls the transaction back and the next caller safely owns the
+        operation. A mismatched fingerprint always conflicts while the record
+        is live; expired records are deleted and the key becomes fresh.
+        """
+        conn.execute(
+            "DELETE FROM companion_operation_idempotency WHERE expires_at <= ?",
+            (now,),
+        )
+        row = conn.execute(
+            """SELECT operation, request_fingerprint, result_metadata_json
+               FROM companion_operation_idempotency
+               WHERE idempotency_id = ?""",
+            (idempotency_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        if row["operation"] != operation or not hmac.compare_digest(
+            row["request_fingerprint"], request_fingerprint
+        ):
+            raise PairingError("conflict")
+        try:
+            metadata = json.loads(row["result_metadata_json"])
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise PairingError("conflict") from exc
+        if not isinstance(metadata, dict):
+            raise PairingError("conflict")
+        return metadata
+
+    def _store_operation_result(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        idempotency_id: bytes,
+        operation: str,
+        request_fingerprint: str,
+        metadata: dict[str, Any],
+        now: float,
+    ) -> None:
+        # Metadata contains identifiers/timestamps only. Secret response values
+        # are deterministically reconstructed from the profile-local derivation
+        # key and opaque request id, never serialized to SQLite.
+        conn.execute(
+            """INSERT INTO companion_operation_idempotency
+               (idempotency_id, operation, request_fingerprint,
+                result_metadata_json, committed_at, expires_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                idempotency_id,
+                operation,
+                request_fingerprint,
+                json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+                now,
+                now + IDEMPOTENCY_TTL_SECONDS,
+            ),
+        )
+
+    def create_invitation(
+        self,
+        actor: str,
+        device_name: Any,
+        *,
+        operation: str | None = None,
+        idempotency_key: str | None = None,
+        request_fingerprint: str | None = None,
+        token_derivation_key: bytes | None = None,
+    ) -> PairingInvitation:
         if (
             not isinstance(actor, str)
             or not actor
@@ -825,11 +999,52 @@ class PairingInvitationStore:
             or device_name != unicodedata.normalize("NFC", device_name)
         ):
             raise PairingError("invalid_request")
-        invitation_id = "inv_" + uuid.uuid4().hex
-        invitation_code = _encode_base64url(secrets.token_bytes(32))
+        durable = operation is not None
+        if durable:
+            idempotency_key, request_fingerprint, token_derivation_key = (
+                self._validate_idempotency_inputs(
+                    idempotency_key, request_fingerprint, token_derivation_key
+                )
+            )
+            idempotency_id = _operation_idempotency_id(
+                token_derivation_key, operation, actor, idempotency_key
+            )
+        else:
+            idempotency_id = b""
+
         now = self.clock()
-        expires_at = now + self.ttl_seconds
         with self._transaction(immediate=True) as conn:
+            if durable:
+                cached = self._load_operation_result(
+                    conn,
+                    idempotency_id=idempotency_id,
+                    operation=operation,
+                    request_fingerprint=request_fingerprint,
+                    now=now,
+                )
+                if cached is not None:
+                    return PairingInvitation(
+                        protocol_revision=PROTOCOL_REVISION,
+                        invitation_id=cached["invitationId"],
+                        invitation_code=_derive_operation_secret(
+                            token_derivation_key,
+                            idempotency_id,
+                            b"invitation-code:"
+                            + cached["invitationId"].encode("ascii"),
+                        ),
+                        gateway_origin=self.gateway_origin,
+                        expires_at=cached["expiresAt"],
+                    )
+                invitation_id = "inv_" + uuid.uuid4().hex
+                invitation_code = _derive_operation_secret(
+                    token_derivation_key,
+                    idempotency_id,
+                    b"invitation-code:" + invitation_id.encode("ascii"),
+                )
+            else:
+                invitation_id = "inv_" + uuid.uuid4().hex
+                invitation_code = _encode_base64url(secrets.token_bytes(32))
+            expires_at = now + self.ttl_seconds
             conn.execute(
                 """INSERT INTO companion_pairing_invitations
                    (invitation_id, code_hash, requested_device_name,
@@ -851,6 +1066,18 @@ class PairingInvitationStore:
                 action="pairing.invitation.create",
                 outcome="success",
             )
+            if durable:
+                self._store_operation_result(
+                    conn,
+                    idempotency_id=idempotency_id,
+                    operation=operation,
+                    request_fingerprint=request_fingerprint,
+                    metadata={
+                        "invitationId": invitation_id,
+                        "expiresAt": _timestamp(expires_at),
+                    },
+                    now=now,
+                )
         return PairingInvitation(
             protocol_revision=PROTOCOL_REVISION,
             invitation_id=invitation_id,
@@ -859,28 +1086,85 @@ class PairingInvitationStore:
             expires_at=_timestamp(expires_at),
         )
 
-    def redeem_invitation(self, payload: dict[str, Any]) -> PairingResult:
+    def redeem_invitation(
+        self,
+        payload: dict[str, Any],
+        *,
+        operation: str | None = None,
+        idempotency_key: str | None = None,
+        request_fingerprint: str | None = None,
+        token_derivation_key: bytes | None = None,
+    ) -> PairingResult:
         try:
-            (
-                invitation_id,
-                invitation_code,
-                spki,
-                key_id,
-                _public_key,
-                _challenge,
-            ) = _pairing_proof_inputs(payload)
+            invitation_id, invitation_code, spki, key_id, _key, _challenge = (
+                _pairing_proof_inputs(payload)
+            )
             now = self.clock()
-            access_token = _encode_base64url(secrets.token_bytes(32))
-            refresh_token = _encode_base64url(secrets.token_bytes(32))
-            device_id = "device_" + uuid.uuid4().hex
-            session_id = "session_" + uuid.uuid4().hex
-            token_family_id = "family_" + uuid.uuid4().hex
-            nonce_hash = hashlib.sha256(
-                payload["clientNonce"].encode("ascii")
-            ).digest()
+            durable = operation is not None
+            if durable:
+                idempotency_key, request_fingerprint, token_derivation_key = (
+                    self._validate_idempotency_inputs(
+                        idempotency_key, request_fingerprint, token_derivation_key
+                    )
+                )
+                idempotency_id = _operation_idempotency_id(
+                    token_derivation_key, operation, invitation_id, idempotency_key
+                )
+                access_token = _derive_operation_secret(
+                    token_derivation_key, idempotency_id, b"access-token"
+                )
+                refresh_token = _derive_operation_secret(
+                    token_derivation_key, idempotency_id, b"refresh-token"
+                )
+                device_id = _derive_public_id("device_", idempotency_id, b"device-id")
+                session_id = _derive_public_id(
+                    "session_", idempotency_id, b"session-id"
+                )
+                token_family_id = _derive_public_id(
+                    "family_", idempotency_id, b"family-id"
+                )
+            else:
+                idempotency_id = b""
+                access_token = _encode_base64url(secrets.token_bytes(32))
+                refresh_token = _encode_base64url(secrets.token_bytes(32))
+                device_id = "device_" + uuid.uuid4().hex
+                session_id = "session_" + uuid.uuid4().hex
+                token_family_id = "family_" + uuid.uuid4().hex
+            nonce_hash = hashlib.sha256(payload["clientNonce"].encode("ascii")).digest()
             code_hash = hashlib.sha256(invitation_code.encode("ascii")).digest()
 
             with self._transaction(immediate=True) as conn:
+                if durable:
+                    cached = self._load_operation_result(
+                        conn,
+                        idempotency_id=idempotency_id,
+                        operation=operation,
+                        request_fingerprint=request_fingerprint,
+                        now=now,
+                    )
+                    if cached is not None:
+                        return PairingResult(
+                            device={
+                                "id": cached["deviceId"],
+                                "name": cached["deviceName"],
+                                "platform": "android",
+                                "status": "paired",
+                                "keyId": cached["keyId"],
+                                "pairedAt": cached["pairedAt"],
+                                "revocationEpoch": 0,
+                            },
+                            credentials={
+                                "tokenType": "DPoP",
+                                "accessToken": access_token,
+                                "accessExpiresAt": cached["accessExpiresAt"],
+                                "refreshToken": refresh_token,
+                                "refreshExpiresAt": cached["refreshExpiresAt"],
+                                "deviceId": cached["deviceId"],
+                                "keyId": cached["keyId"],
+                                "sessionId": cached["sessionId"],
+                                "revocationEpoch": 0,
+                            },
+                        )
                 conn.execute(
                     "DELETE FROM companion_pairing_nonces WHERE expires_at <= ?",
                     (now,),
@@ -951,6 +1235,27 @@ class PairingInvitationStore:
                     action="pairing.invitation.redeem",
                     outcome="success",
                 )
+                if durable:
+                    self._store_operation_result(
+                        conn,
+                        idempotency_id=idempotency_id,
+                        operation=operation,
+                        request_fingerprint=request_fingerprint,
+                        metadata={
+                            "deviceId": device_id,
+                            "deviceName": payload["deviceName"],
+                            "keyId": key_id,
+                            "pairedAt": _timestamp(now),
+                            "sessionId": session_id,
+                            "accessExpiresAt": _timestamp(
+                                now + ACCESS_TOKEN_TTL_SECONDS
+                            ),
+                            "refreshExpiresAt": _timestamp(
+                                now + REFRESH_TOKEN_TTL_SECONDS
+                            ),
+                        },
+                        now=now,
+                    )
         except PairingError as exc:
             self._audit_failure("pairing.invitation.redeem", exc.code)
             raise
@@ -1177,7 +1482,9 @@ class PairingInvitationStore:
                     or int(row["session_epoch"]) != int(row["device_epoch"])
                 ):
                     raise PairingError("invalid_token")
-                if row["public_key_spki"] != spki or row["key_id"] != derive_key_id(spki):
+                if row["public_key_spki"] != spki or row["key_id"] != derive_key_id(
+                    spki
+                ):
                     raise PairingError("proof_invalid")
                 try:
                     scopes = tuple(json.loads(row["scopes_json"]))
@@ -1295,7 +1602,9 @@ class PairingInvitationStore:
                     ).fetchone()
                 if row is None:
                     raise PairingError("invalid_token")
-                if row["public_key_spki"] != spki or row["key_id"] != derive_key_id(spki):
+                if row["public_key_spki"] != spki or row["key_id"] != derive_key_id(
+                    spki
+                ):
                     raise PairingError("proof_invalid")
 
                 idempotency_id = _refresh_idempotency_id(
@@ -1381,7 +1690,9 @@ class PairingInvitationStore:
                         or int(row["session_epoch"]) != int(row["device_epoch"])
                     ):
                         raise PairingError("invalid_token")
-                    if row["public_key_spki"] != spki or row["key_id"] != derive_key_id(spki):
+                    if row["public_key_spki"] != spki or row["key_id"] != derive_key_id(
+                        spki
+                    ):
                         raise PairingError("proof_invalid")
                     new_access_token, new_refresh_token = _derive_refresh_tokens(
                         token_derivation_key, row["session_id"], idempotency_key
@@ -1407,12 +1718,8 @@ class PairingInvitationStore:
                            WHERE session_id = ? AND refresh_token_hash = ?
                              AND revoked_at IS NULL""",
                         (
-                            hashlib.sha256(
-                                new_access_token.encode("ascii")
-                            ).digest(),
-                            hashlib.sha256(
-                                new_refresh_token.encode("ascii")
-                            ).digest(),
+                            hashlib.sha256(new_access_token.encode("ascii")).digest(),
+                            hashlib.sha256(new_refresh_token.encode("ascii")).digest(),
                             now + ACCESS_TOKEN_TTL_SECONDS,
                             now + REFRESH_TOKEN_TTL_SECONDS,
                             row["session_id"],
@@ -1497,8 +1804,8 @@ class PairingInvitationStore:
                 method=method,
                 htu=htu,
             )
-            current_key_id, new_spki, new_key_id, nonce_hash = (
-                _rotation_proof_inputs(payload, device_id=device_id, now=now)
+            current_key_id, new_spki, new_key_id, nonce_hash = _rotation_proof_inputs(
+                payload, device_id=device_id, now=now
             )
             access_hash = hashlib.sha256(access_token.encode("ascii")).digest()
             with self._transaction(immediate=True) as conn:
@@ -1506,7 +1813,8 @@ class PairingInvitationStore:
                     "DELETE FROM companion_dpop_replay WHERE expires_at <= ?", (now,)
                 )
                 conn.execute(
-                    "DELETE FROM companion_rotation_nonces WHERE expires_at <= ?", (now,)
+                    "DELETE FROM companion_rotation_nonces WHERE expires_at <= ?",
+                    (now,),
                 )
                 conn.execute(
                     "DELETE FROM companion_rotation_idempotency WHERE expires_at <= ?",
@@ -1577,12 +1885,16 @@ class PairingInvitationStore:
                         raise PairingError("invalid_token")
                     if state["session_revoked_at"] is not None:
                         raise PairingError("session_revoked")
-                    if state["status"] != "paired" or state["device_revoked_at"] is not None:
+                    if (
+                        state["status"] != "paired"
+                        or state["device_revoked_at"] is not None
+                    ):
                         raise PairingError("device_revoked")
                     if (
                         state["session_key_id"] != cached["new_key_id"]
                         or state["device_key_id"] != cached["new_key_id"]
-                        or int(state["session_epoch"]) != int(cached["revocation_epoch"])
+                        or int(state["session_epoch"])
+                        != int(cached["revocation_epoch"])
                         or int(state["device_epoch"]) != int(cached["revocation_epoch"])
                     ):
                         raise PairingError("invalid_token")
@@ -1770,16 +2082,39 @@ class PairingInvitationStore:
             "previousKeyRevokedAt": _timestamp(previous_key_revoked_at),
         }
 
-    def list_devices(self) -> dict[str, Any]:
+    def list_devices(
+        self,
+        *,
+        limit: int = 50,
+        cursor: str | None = None,
+        cursor_key: bytes,
+    ) -> dict[str, Any]:
+        after: tuple[float, str] | None = None
+        if cursor is not None:
+            values = _decode_page_cursor("devices", cursor, cursor_key)
+            if (
+                isinstance(values[0], bool)
+                or not isinstance(values[0], (int, float))
+                or not isinstance(values[1], str)
+            ):
+                raise PairingError("invalid_request")
+            after = (float(values[0]), values[1])
         conn = self._connect()
         try:
-            rows = conn.execute(
-                """SELECT device_id, device_name, platform, status, key_id,
-                          paired_at, revoked_at, revocation_epoch
-                   FROM companion_devices ORDER BY paired_at, device_id"""
-            ).fetchall()
+            query = """SELECT device_id, device_name, platform, status, key_id,
+                              paired_at, revoked_at, revocation_epoch
+                       FROM companion_devices"""
+            params: list[Any] = []
+            if after is not None:
+                query += " WHERE paired_at > ? OR (paired_at = ? AND device_id > ?)"
+                params.extend((after[0], after[0], after[1]))
+            query += " ORDER BY paired_at, device_id LIMIT ?"
+            params.append(limit + 1)
+            rows = conn.execute(query, params).fetchall()
+            has_more = len(rows) > limit
+            page_rows = rows[:limit]
             items = []
-            for row in rows:
+            for row in page_rows:
                 device = {
                     "id": row["device_id"],
                     "name": row["device_name"],
@@ -1792,36 +2127,76 @@ class PairingInvitationStore:
                 if row["revoked_at"] is not None:
                     device["revokedAt"] = _timestamp(row["revoked_at"])
                 items.append(device)
-            return {"items": items, "nextCursor": None}
+            result: dict[str, Any] = {"items": items, "hasMore": has_more}
+            if has_more:
+                last = page_rows[-1]
+                result["nextCursor"] = _encode_page_cursor(
+                    "devices",
+                    [float(last["paired_at"]), last["device_id"]],
+                    cursor_key,
+                )
+            return result
         finally:
             conn.close()
 
-    def list_sessions(self) -> dict[str, Any]:
+    def list_sessions(
+        self,
+        *,
+        limit: int = 50,
+        cursor: str | None = None,
+        cursor_key: bytes,
+    ) -> dict[str, Any]:
+        after: tuple[float, str] | None = None
+        if cursor is not None:
+            values = _decode_page_cursor("sessions", cursor, cursor_key)
+            if (
+                isinstance(values[0], bool)
+                or not isinstance(values[0], (int, float))
+                or not isinstance(values[1], str)
+            ):
+                raise PairingError("invalid_request")
+            after = (float(values[0]), values[1])
         conn = self._connect()
         try:
-            rows = conn.execute(
-                """SELECT session_id, device_id, key_id, access_expires_at,
-                          refresh_expires_at, revocation_epoch, revoked_at
-                   FROM companion_credential_sessions
-                   ORDER BY rowid, session_id"""
-            ).fetchall()
-            return {
+            sessions_exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions'"
+            ).fetchone()
+            if sessions_exists is None:
+                return {"items": [], "hasMore": False}
+            updated_sql = "COALESCE(last_activity_at, ended_at, started_at)"
+            query = f"""SELECT id, COALESCE(title, display_name, '') AS title,
+                                started_at, {updated_sql} AS updated_at
+                         FROM sessions
+                         WHERE LOWER(source) != 'cron'"""
+            params: list[Any] = []
+            if after is not None:
+                query += f" AND ({updated_sql} > ? OR ({updated_sql} = ? AND id > ?))"
+                params.extend((after[0], after[0], after[1]))
+            query += f" ORDER BY {updated_sql}, id LIMIT ?"
+            params.append(limit + 1)
+            rows = conn.execute(query, params).fetchall()
+            has_more = len(rows) > limit
+            page_rows = rows[:limit]
+            result: dict[str, Any] = {
                 "items": [
                     {
-                        "id": row["session_id"],
-                        "deviceId": row["device_id"],
-                        "keyId": row["key_id"],
-                        "status": (
-                            "revoked" if row["revoked_at"] is not None else "active"
-                        ),
-                        "accessExpiresAt": _timestamp(row["access_expires_at"]),
-                        "refreshExpiresAt": _timestamp(row["refresh_expires_at"]),
-                        "revocationEpoch": int(row["revocation_epoch"]),
+                        "id": row["id"],
+                        "title": row["title"],
+                        "createdAt": _timestamp(row["started_at"]),
+                        "updatedAt": _timestamp(row["updated_at"]),
                     }
-                    for row in rows
+                    for row in page_rows
                 ],
-                "nextCursor": None,
+                "hasMore": has_more,
             }
+            if has_more:
+                last = page_rows[-1]
+                result["nextCursor"] = _encode_page_cursor(
+                    "sessions",
+                    [float(last["updated_at"]), last["id"]],
+                    cursor_key,
+                )
+            return result
         finally:
             conn.close()
 
@@ -1857,11 +2232,44 @@ class PairingInvitationStore:
             raise PairingError("invalid_request")
         return reason
 
-    def revoke_session(self, actor: str, session_id: Any, reason: Any) -> dict[str, Any]:
+    def revoke_session(
+        self,
+        actor: str,
+        session_id: Any,
+        reason: Any,
+        *,
+        operation: str | None = None,
+        idempotency_key: str | None = None,
+        request_fingerprint: str | None = None,
+        token_derivation_key: bytes | None = None,
+    ) -> dict[str, Any]:
         session_id = _validate_public_id(session_id)
         self._validate_revocation_reason(reason)
         now = self.clock()
+        durable = operation is not None
+        if durable:
+            idempotency_key, request_fingerprint, token_derivation_key = (
+                self._validate_idempotency_inputs(
+                    idempotency_key, request_fingerprint, token_derivation_key
+                )
+            )
+            idempotency_id = _operation_idempotency_id(
+                token_derivation_key,
+                operation,
+                f"{actor}\0{session_id}",
+                idempotency_key,
+            )
         with self._transaction(immediate=True) as conn:
+            if durable:
+                cached = self._load_operation_result(
+                    conn,
+                    idempotency_id=idempotency_id,
+                    operation=operation,
+                    request_fingerprint=request_fingerprint,
+                    now=now,
+                )
+                if cached is not None:
+                    return cached
             row = conn.execute(
                 """SELECT device_id, revoked_at
                    FROM companion_credential_sessions WHERE session_id = ?""",
@@ -1869,12 +2277,20 @@ class PairingInvitationStore:
             ).fetchone()
             if row is None:
                 raise PairingError("not_found")
-            revoked_at = float(row["revoked_at"]) if row["revoked_at"] is not None else now
+            revoked_at = (
+                float(row["revoked_at"]) if row["revoked_at"] is not None else now
+            )
             conn.execute(
                 """UPDATE companion_credential_sessions SET revoked_at = ?
                    WHERE session_id = ? AND revoked_at IS NULL""",
                 (revoked_at, session_id),
             )
+            result = {
+                "sessionId": session_id,
+                "deviceId": row["device_id"],
+                "status": "revoked",
+                "revokedAt": _timestamp(revoked_at),
+            }
             self._audit(
                 conn,
                 actor=actor,
@@ -1882,18 +2298,55 @@ class PairingInvitationStore:
                 action="session.revoke",
                 outcome="success",
             )
-        return {
-            "sessionId": session_id,
-            "deviceId": row["device_id"],
-            "status": "revoked",
-            "revokedAt": _timestamp(revoked_at),
-        }
+            if durable:
+                self._store_operation_result(
+                    conn,
+                    idempotency_id=idempotency_id,
+                    operation=operation,
+                    request_fingerprint=request_fingerprint,
+                    metadata=result,
+                    now=now,
+                )
+        return result
 
-    def revoke_device(self, actor: str, device_id: Any, reason: Any) -> dict[str, Any]:
+    def revoke_device(
+        self,
+        actor: str,
+        device_id: Any,
+        reason: Any,
+        *,
+        operation: str | None = None,
+        idempotency_key: str | None = None,
+        request_fingerprint: str | None = None,
+        token_derivation_key: bytes | None = None,
+    ) -> dict[str, Any]:
         device_id = _validate_public_id(device_id)
         self._validate_revocation_reason(reason)
         now = self.clock()
+        durable = operation is not None
+        if durable:
+            idempotency_key, request_fingerprint, token_derivation_key = (
+                self._validate_idempotency_inputs(
+                    idempotency_key, request_fingerprint, token_derivation_key
+                )
+            )
+            idempotency_id = _operation_idempotency_id(
+                token_derivation_key,
+                operation,
+                f"{actor}\0{device_id}",
+                idempotency_key,
+            )
         with self._transaction(immediate=True) as conn:
+            if durable:
+                cached = self._load_operation_result(
+                    conn,
+                    idempotency_id=idempotency_id,
+                    operation=operation,
+                    request_fingerprint=request_fingerprint,
+                    now=now,
+                )
+                if cached is not None:
+                    return cached
             row = conn.execute(
                 """SELECT status, revoked_at, revocation_epoch
                    FROM companion_devices WHERE device_id = ?""",
@@ -1918,6 +2371,19 @@ class PairingInvitationStore:
                    WHERE device_id = ? AND revoked_at IS NULL""",
                 (revoked_at, device_id),
             )
+            result = {
+                "deviceId": device_id,
+                "status": "revoked",
+                "revokedAt": _timestamp(revoked_at),
+                "revocationEpoch": epoch,
+                "effects": {
+                    "restDenied": True,
+                    "refreshDenied": True,
+                    "webSocketsClosed": True,
+                    "pendingDeliveryCanceled": True,
+                    "localEraseRequired": True,
+                },
+            }
             self._audit(
                 conn,
                 actor=actor,
@@ -1925,19 +2391,16 @@ class PairingInvitationStore:
                 action="device.revoke",
                 outcome="success",
             )
-        return {
-            "deviceId": device_id,
-            "status": "revoked",
-            "revokedAt": _timestamp(revoked_at),
-            "revocationEpoch": epoch,
-            "effects": {
-                "restDenied": True,
-                "refreshDenied": True,
-                "webSocketsClosed": True,
-                "pendingDeliveryCanceled": True,
-                "localEraseRequired": True,
-            },
-        }
+            if durable:
+                self._store_operation_result(
+                    conn,
+                    idempotency_id=idempotency_id,
+                    operation=operation,
+                    request_fingerprint=request_fingerprint,
+                    metadata=result,
+                    now=now,
+                )
+        return result
 
     def bootstrap(self, principal: DevicePrincipal) -> dict[str, Any]:
         """Return truthful bootstrap metadata for the currently empty slice."""

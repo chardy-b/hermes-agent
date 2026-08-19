@@ -24,9 +24,7 @@ from gateway.pairing_invitations import (
 )
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "pairing-proof-es256.json"
-ROTATION_FIXTURE_PATH = (
-    Path(__file__).parent / "fixtures" / "rotation-proof-es256.json"
-)
+ROTATION_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "rotation-proof-es256.json"
 ORIGIN = "https://gateway.example.test"
 
 
@@ -115,9 +113,10 @@ def test_normative_pairing_proof_fixture_verifies_exact_bytes_and_negatives():
     fields = fixture["challengeFields"]
     challenge = canonical_pairing_challenge(fields)
     assert challenge.decode("utf-8") == fixture["canonicalChallengeUtf8"]
-    assert b64url(hashlib.sha256(challenge).digest()) == fixture[
-        "canonicalChallengeSha256Base64Url"
-    ]
+    assert (
+        b64url(hashlib.sha256(challenge).digest())
+        == fixture["canonicalChallengeSha256Base64Url"]
+    )
 
     payload = {
         "protocolRevision": fields["protocolRevision"],
@@ -166,12 +165,11 @@ def test_normative_rotation_proof_fixture_matches_merged_wil46_contract():
     fields = fixture["challengeFields"]
     challenge = canonical_rotation_challenge(fields)
     assert challenge.decode("utf-8") == fixture["canonicalChallengeUtf8"]
-    assert b64url(hashlib.sha256(challenge).digest()) == fixture[
-        "canonicalChallengeSha256Base64Url"
-    ]
-    spki = base64.urlsafe_b64decode(
-        fixture["newPublicKeySpkiDerBase64Url"] + "=="
+    assert (
+        b64url(hashlib.sha256(challenge).digest())
+        == fixture["canonicalChallengeSha256Base64Url"]
     )
+    spki = base64.urlsafe_b64decode(fixture["newPublicKeySpkiDerBase64Url"] + "==")
     public_key = serialization.load_der_public_key(spki)
     assert isinstance(public_key, ec.EllipticCurvePublicKey)
     signature = base64.urlsafe_b64decode(fixture["signatureBase64Url"] + "==")
@@ -190,6 +188,29 @@ def test_duplicate_json_names_and_obsolete_pairing_shape_fail_closed(tmp_path):
     store = PairingInvitationStore(gateway_origin=ORIGIN, db_path=tmp_path / "state.db")
     with pytest.raises(PairingError, match="pairing_protocol_upgrade_required"):
         store.redeem_invitation({"invitationCode": "old", "deviceName": "Phone"})
+
+
+def test_invitation_idempotency_ttl_releases_key_for_a_fresh_operation(tmp_path):
+    now = [1_800_000_000.0]
+    store = PairingInvitationStore(
+        gateway_origin=ORIGIN,
+        db_path=tmp_path / "state.db",
+        clock=lambda: now[0],
+    )
+    kwargs = {
+        "operation": "pairing.invitation.create:/companion/v1/pairing/invitations",
+        "idempotency_key": "ttl-create-key",
+        "request_fingerprint": hashlib.sha256(b'{"deviceName":"Pixel"}').hexdigest(),
+        "token_derivation_key": b"profile-local-test-derivation-key",
+    }
+    first = store.create_invitation("operator:api_server", "Pixel", **kwargs)
+    repeated = store.create_invitation("operator:api_server", "Pixel", **kwargs)
+    assert repeated == first
+
+    now[0] += 24 * 60 * 60 + 1
+    after_ttl = store.create_invitation("operator:api_server", "Pixel", **kwargs)
+    assert after_ttl.invitation_id != first.invitation_id
+    assert after_ttl.invitation_code != first.invitation_code
 
 
 def test_durable_atomic_registration_and_redacted_audit(tmp_path):
