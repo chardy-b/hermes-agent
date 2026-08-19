@@ -8,7 +8,7 @@ import hmac
 import ipaddress
 import json
 import logging
-import time
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -28,8 +28,6 @@ from hermes_constants import get_hermes_home
 logger = logging.getLogger(__name__)
 
 _BASE_PATH = "/companion/v1"
-_IDEMPOTENCY_TTL_SECONDS = 300
-_IDEMPOTENCY_MAX_ITEMS = 256
 _PAIRING_CREATE_SCOPE = "companion.pairing.create"
 _DEVICE_READ_SCOPE = "companion.devices.read"
 _DEVICE_REVOKE_SCOPE = "companion.devices.revoke"
@@ -59,20 +57,83 @@ _ERROR_STATUS = {
 _RETRYABLE_CODES = frozenset()
 
 
+class WebSocketCloseTimeout(Exception):
+    """Durable revocation committed, but socket close was not confirmed."""
+
+
+def _safe_outcome_response(
+    *,
+    message: str,
+    retryable: bool,
+    details: dict[str, str],
+    status: int = 503,
+) -> web.Response:
+    response = web.json_response(
+        {
+            "code": "conflict",
+            "message": message,
+            "retryable": retryable,
+            "details": details,
+        },
+        status=status,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def _storage_failure_response(
+    exc: BaseException, *, outcome: str
+) -> web.Response | None:
+    """Classify storage readiness without returning paths or raw DB errors."""
+    if isinstance(exc, PermissionError):
+        category, retryable = "unwritable", False
+    elif isinstance(exc, sqlite3.DatabaseError):
+        message = str(exc).lower()
+        if any(token in message for token in ("locked", "busy")):
+            category, retryable = "locked", True
+        elif any(
+            token in message
+            for token in ("malformed", "not a database", "database corrupt")
+        ):
+            category, retryable = "corrupt", False
+        elif any(
+            token in message
+            for token in (
+                "readonly",
+                "read-only",
+                "disk i/o",
+                "database or disk is full",
+            )
+        ):
+            category, retryable = "unwritable", False
+        else:
+            category, retryable = "unavailable", True
+    elif isinstance(exc, OSError):
+        category, retryable = "unwritable", False
+    else:
+        return None
+    logger.error(
+        "[api_server] companion state unavailable (category=%s, retryable=%s)",
+        category,
+        retryable,
+    )
+    return _safe_outcome_response(
+        message="Companion state is unavailable.",
+        retryable=retryable,
+        details={
+            "readiness": "unavailable",
+            "outcome": outcome,
+            "storageCategory": category,
+        },
+    )
+
+
 @dataclass
 class _CompanionSocket:
     principal: DevicePrincipal
     revoke_event: asyncio.Event
     closed_event: asyncio.Event
     reason: str = "authentication_revoked"
-
-
-@dataclass(frozen=True)
-class _CachedResponse:
-    fingerprint: str
-    body: dict[str, Any]
-    status: int
-    expires_at: float
 
 
 def _error_response(code: str) -> web.Response:
@@ -125,8 +186,6 @@ class CompanionAPI:
         self.trusted_loopback_proxy = False
         self._stores: dict[str, PairingInvitationStore] = {}
         self._store_lock = asyncio.Lock()
-        self._idempotency: dict[str, _CachedResponse] = {}
-        self._idempotency_lock = asyncio.Lock()
         self._websockets: dict[web.WebSocketResponse, _CompanionSocket] = {}
         self._websocket_lock = asyncio.Lock()
 
@@ -192,6 +251,16 @@ class CompanionAPI:
             ("GET", f"{_BASE_PATH}/events", self.websocket_events),
         ]
 
+    @staticmethod
+    def _unexpected_failure(
+        exc: Exception, operation: str, *, outcome: str = "unknown"
+    ) -> web.Response:
+        storage_response = _storage_failure_response(exc, outcome=outcome)
+        if storage_response is not None:
+            return storage_response
+        logger.exception("[api_server] companion %s failed", operation)
+        return _error_response("invalid_request")
+
     async def _store(self) -> PairingInvitationStore:
         home = Path(get_hermes_home())
         key = str(home)
@@ -245,10 +314,6 @@ class CompanionAPI:
             raise PairingError("invalid_request")
         return value
 
-    def _idempotency_namespace(self, request: web.Request, key: str) -> str:
-        profile = request.match_info.get("profile", "")
-        return f"{profile}|{request.path}|{key}"
-
     @staticmethod
     def _fingerprint(body: dict[str, Any]) -> str:
         canonical = json.dumps(
@@ -256,41 +321,33 @@ class CompanionAPI:
         ).encode("utf-8")
         return hashlib.sha256(canonical).hexdigest()
 
-    def _purge_idempotency(self, now: float) -> None:
-        expired = [
-            key for key, value in self._idempotency.items() if value.expires_at <= now
-        ]
-        for key in expired:
-            self._idempotency.pop(key, None)
-        while len(self._idempotency) > _IDEMPOTENCY_MAX_ITEMS:
-            self._idempotency.pop(next(iter(self._idempotency)))
-
-    async def _idempotent(
-        self,
-        request: web.Request,
-        body: dict[str, Any],
-        compute: Callable[[], Awaitable[tuple[dict[str, Any], int]]],
-    ) -> web.Response:
-        key = self._idempotency_key(request)
-        namespace = self._idempotency_namespace(request, key)
-        fingerprint = self._fingerprint(body)
-        async with self._idempotency_lock:
-            now = time.time()
-            self._purge_idempotency(now)
-            cached = self._idempotency.get(namespace)
-            if cached is not None:
-                if not hmac.compare_digest(cached.fingerprint, fingerprint):
-                    return _error_response("conflict")
-                return _success_response(dict(cached.body), status=cached.status)
-            response_body, status = await compute()
-            self._idempotency[namespace] = _CachedResponse(
-                fingerprint=fingerprint,
-                body=dict(response_body),
-                status=status,
-                expires_at=now + _IDEMPOTENCY_TTL_SECONDS,
-            )
-            self._purge_idempotency(now)
-            return _success_response(response_body, status=status)
+    def _pagination(self, request: web.Request) -> tuple[int, str | None, bytes]:
+        if (
+            len(request.query.getall("limit", [])) > 1
+            or len(request.query.getall("cursor", [])) > 1
+        ):
+            raise PairingError("invalid_request")
+        raw_limit = request.query.get("limit")
+        if raw_limit is None:
+            limit = 50
+        else:
+            if not raw_limit.isascii() or not raw_limit.isdecimal():
+                raise PairingError("invalid_request")
+            limit = int(raw_limit)
+            if not 1 <= limit <= 100:
+                raise PairingError("invalid_request")
+        cursor = request.query.get("cursor")
+        if cursor == "":
+            raise PairingError("invalid_request")
+        secret = self.adapter._expected_api_key()
+        if not secret:
+            raise PairingError("invalid_request")
+        cursor_key = hmac.new(
+            secret.encode("utf-8"),
+            b"HERMES-COMPANION-PAGINATION-V1",
+            hashlib.sha256,
+        ).digest()
+        return limit, cursor, cursor_key
 
     def _operator_error(self, request: web.Request, scope: str) -> web.Response | None:
         auth_error = self.adapter._check_auth(request)
@@ -352,33 +409,51 @@ class CompanionAPI:
                     timeout=5,
                 )
             except TimeoutError as exc:
-                raise PairingError("conflict") from exc
+                raise WebSocketCloseTimeout from exc
 
     async def list_devices(self, request: web.Request) -> web.Response:
         error = self._operator_error(request, _DEVICE_READ_SCOPE)
         if error is not None:
             return error
         try:
+            limit, cursor, cursor_key = self._pagination(request)
             store = await self._store()
-            return _success_response(await asyncio.to_thread(store.list_devices))
+            return _success_response(
+                await asyncio.to_thread(
+                    store.list_devices,
+                    limit=limit,
+                    cursor=cursor,
+                    cursor_key=cursor_key,
+                )
+            )
         except PairingError as exc:
             return _error_response(exc.code)
-        except Exception:
-            logger.exception("[api_server] companion device listing failed")
-            return _error_response("invalid_request")
+        except Exception as exc:
+            return self._unexpected_failure(
+                exc, "device listing", outcome="not_applicable"
+            )
 
     async def list_sessions(self, request: web.Request) -> web.Response:
         error = self._operator_error(request, _SESSION_READ_SCOPE)
         if error is not None:
             return error
         try:
+            limit, cursor, cursor_key = self._pagination(request)
             store = await self._store()
-            return _success_response(await asyncio.to_thread(store.list_sessions))
+            return _success_response(
+                await asyncio.to_thread(
+                    store.list_sessions,
+                    limit=limit,
+                    cursor=cursor,
+                    cursor_key=cursor_key,
+                )
+            )
         except PairingError as exc:
             return _error_response(exc.code)
-        except Exception:
-            logger.exception("[api_server] companion session listing failed")
-            return _error_response("invalid_request")
+        except Exception as exc:
+            return self._unexpected_failure(
+                exc, "session listing", outcome="not_applicable"
+            )
 
     async def rotate_device_key(self, request: web.Request) -> web.Response:
         if not self._transport_allowed(request):
@@ -413,9 +488,8 @@ class CompanionAPI:
             return _success_response(result)
         except PairingError as exc:
             return _error_response(exc.code)
-        except Exception:
-            logger.exception("[api_server] companion key rotation failed")
-            return _error_response("invalid_request")
+        except Exception as exc:
+            return self._unexpected_failure(exc, "key rotation")
 
     async def revoke_device(self, request: web.Request) -> web.Response:
         if not self._transport_allowed(request):
@@ -435,13 +509,20 @@ class CompanionAPI:
             body = await self._body(request)
             if set(body) != {"reason"}:
                 raise PairingError("invalid_request")
-            self._idempotency_key(request)
+            idempotency_key = self._idempotency_key(request)
+            derivation_secret = self.adapter._expected_api_key()
+            if not derivation_secret:
+                raise PairingError("invalid_request")
             store = await self._store()
             result = await asyncio.to_thread(
                 store.revoke_device,
                 actor,
                 device_id,
                 body["reason"],
+                operation=f"device.revoke:{request.path}",
+                idempotency_key=idempotency_key,
+                request_fingerprint=self._fingerprint(body),
+                token_derivation_key=derivation_secret.encode("utf-8"),
             )
             # The durable state changes first; active channels are closed before
             # success is returned, satisfying the five-second contract deadline.
@@ -449,11 +530,20 @@ class CompanionAPI:
                 device_id=result["deviceId"], reason="device_revoked"
             )
             return _success_response(result)
+        except WebSocketCloseTimeout:
+            return _safe_outcome_response(
+                message="Revocation committed; channel closure is still pending.",
+                retryable=True,
+                details={
+                    "readiness": "degraded",
+                    "outcome": "committed",
+                    "delivery": "websocket_close_timeout",
+                },
+            )
         except PairingError as exc:
             return _error_response(exc.code)
-        except Exception:
-            logger.exception("[api_server] companion device revocation failed")
-            return _error_response("invalid_request")
+        except Exception as exc:
+            return self._unexpected_failure(exc, "device revocation")
 
     async def revoke_session(self, request: web.Request) -> web.Response:
         error = self._operator_error(request, _SESSION_REVOKE_SCOPE)
@@ -463,23 +553,39 @@ class CompanionAPI:
             body = await self._body(request)
             if set(body) != {"reason"}:
                 raise PairingError("invalid_request")
-            self._idempotency_key(request)
+            idempotency_key = self._idempotency_key(request)
+            derivation_secret = self.adapter._expected_api_key()
+            if not derivation_secret:
+                raise PairingError("invalid_request")
             store = await self._store()
             result = await asyncio.to_thread(
                 store.revoke_session,
                 "operator:api_server",
                 request.match_info.get("session_id"),
                 body["reason"],
+                operation=f"session.revoke:{request.path}",
+                idempotency_key=idempotency_key,
+                request_fingerprint=self._fingerprint(body),
+                token_derivation_key=derivation_secret.encode("utf-8"),
             )
             await self._close_websockets(
                 session_id=result["sessionId"], reason="session_revoked"
             )
             return _success_response(result)
+        except WebSocketCloseTimeout:
+            return _safe_outcome_response(
+                message="Revocation committed; channel closure is still pending.",
+                retryable=True,
+                details={
+                    "readiness": "degraded",
+                    "outcome": "committed",
+                    "delivery": "websocket_close_timeout",
+                },
+            )
         except PairingError as exc:
             return _error_response(exc.code)
-        except Exception:
-            logger.exception("[api_server] companion session revocation failed")
-            return _error_response("invalid_request")
+        except Exception as exc:
+            return self._unexpected_failure(exc, "session revocation")
 
     async def websocket_events(self, request: web.Request) -> web.StreamResponse:
         if not self._transport_allowed(request):
@@ -488,9 +594,10 @@ class CompanionAPI:
             store, principal = await self._authenticate_device(request)
         except PairingError as exc:
             return _error_response(exc.code)
-        except Exception:
-            logger.exception("[api_server] companion WebSocket authentication failed")
-            return _error_response("invalid_request")
+        except Exception as exc:
+            return self._unexpected_failure(
+                exc, "WebSocket authentication", outcome="not_applicable"
+            )
 
         ws = web.WebSocketResponse(heartbeat=30, max_msg_size=64 * 1024)
         await ws.prepare(request)
@@ -566,21 +673,24 @@ class CompanionAPI:
             if set(body) != {"deviceName"}:
                 raise PairingError("invalid_request")
             store = await self._store()
-
-            async def compute() -> tuple[dict[str, Any], int]:
-                invitation = await asyncio.to_thread(
-                    store.create_invitation,
-                    "operator:api_server",
-                    body["deviceName"],
-                )
-                return invitation.as_dict(), 201
-
-            return await self._idempotent(request, body, compute)
+            idempotency_key = self._idempotency_key(request)
+            derivation_secret = self.adapter._expected_api_key()
+            if not derivation_secret:
+                raise PairingError("invalid_request")
+            invitation = await asyncio.to_thread(
+                store.create_invitation,
+                "operator:api_server",
+                body["deviceName"],
+                operation=f"pairing.invitation.create:{request.path}",
+                idempotency_key=idempotency_key,
+                request_fingerprint=self._fingerprint(body),
+                token_derivation_key=derivation_secret.encode("utf-8"),
+            )
+            return _success_response(invitation.as_dict(), status=201)
         except PairingError as exc:
             return _error_response(exc.code)
-        except Exception:
-            logger.exception("[api_server] companion invitation creation failed")
-            return _error_response("invalid_request")
+        except Exception as exc:
+            return self._unexpected_failure(exc, "invitation creation")
 
     async def redeem_invitation(self, request: web.Request) -> web.Response:
         if not self._transport_allowed(request):
@@ -588,17 +698,23 @@ class CompanionAPI:
         try:
             body = await self._body(request)
             store = await self._store()
-
-            async def compute() -> tuple[dict[str, Any], int]:
-                result = await asyncio.to_thread(store.redeem_invitation, body)
-                return result.as_dict(), 200
-
-            return await self._idempotent(request, body, compute)
+            idempotency_key = self._idempotency_key(request)
+            derivation_secret = self.adapter._expected_api_key()
+            if not derivation_secret:
+                raise PairingError("invalid_request")
+            result = await asyncio.to_thread(
+                store.redeem_invitation,
+                body,
+                operation=f"pairing.invitation.redeem:{request.path}",
+                idempotency_key=idempotency_key,
+                request_fingerprint=self._fingerprint(body),
+                token_derivation_key=derivation_secret.encode("utf-8"),
+            )
+            return _success_response(result.as_dict())
         except PairingError as exc:
             return _error_response(exc.code)
-        except Exception:
-            logger.exception("[api_server] companion invitation redemption failed")
-            return _error_response("invalid_request")
+        except Exception as exc:
+            return self._unexpected_failure(exc, "invitation redemption")
 
     async def refresh_credentials(self, request: web.Request) -> web.Response:
         if not self._transport_allowed(request):
@@ -632,9 +748,8 @@ class CompanionAPI:
             return _success_response(credentials)
         except PairingError as exc:
             return _error_response(exc.code)
-        except Exception:
-            logger.exception("[api_server] companion credential refresh failed")
-            return _error_response("invalid_request")
+        except Exception as exc:
+            return self._unexpected_failure(exc, "credential refresh")
 
     async def bootstrap(self, request: web.Request) -> web.Response:
         if not self._transport_allowed(request):
@@ -661,6 +776,5 @@ class CompanionAPI:
             return _success_response(body)
         except PairingError as exc:
             return _error_response(exc.code)
-        except Exception:
-            logger.exception("[api_server] companion bootstrap failed")
-            return _error_response("invalid_request")
+        except Exception as exc:
+            return self._unexpected_failure(exc, "bootstrap", outcome="not_applicable")

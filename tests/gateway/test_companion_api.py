@@ -3,6 +3,7 @@ import base64
 import hashlib
 import json
 import sqlite3
+import threading
 from datetime import datetime, timezone
 
 import pytest
@@ -20,6 +21,7 @@ from gateway.pairing_invitations import (
     derive_key_id,
 )
 from gateway.platforms.api_server import APIServerAdapter
+from tests.gateway.companion_contract import CompanionContract
 
 ORIGIN = "https://gateway.example.test"
 API_KEY = "operator-api-key-with-32-bytes-minimum"
@@ -432,7 +434,6 @@ async def test_pair_redeem_and_dpop_bootstrap_real_http_path():
         # Simulate process-local cache/store loss. Durable idempotency must
         # reconstruct the same rotated pair without persisting raw tokens or
         # misclassifying the retry as refresh-token reuse.
-        _adapter._companion_api._idempotency.clear()
         _adapter._companion_api._stores.clear()
         retried = await client.post(
             refresh_path,
@@ -567,7 +568,6 @@ async def test_refresh_idempotency_is_namespaced_per_device_and_survives_restart
         assert rotated[0]["accessToken"] != rotated[1]["accessToken"]
 
         # Process/cache loss must still reconstruct each device's own result.
-        adapter._companion_api._idempotency.clear()
         adapter._companion_api._stores.clear()
         for index, (private_key, result) in enumerate(paired):
             refresh_token = result["credentials"]["refreshToken"]
@@ -612,9 +612,7 @@ async def test_authenticated_management_and_websocket_revocation_surface(
         ]
         sessions = await client.get("/companion/v1/sessions", headers=operator_headers)
         assert sessions.status == 200
-        assert [item["id"] for item in (await sessions.json())["items"]] == [
-            credentials["sessionId"]
-        ]
+        assert await sessions.json() == {"items": [], "hasMore": False}
 
         ws_path = "/companion/v1/events"
         ws = await client.ws_connect(
@@ -888,7 +886,6 @@ async def test_key_rotation_replaces_credentials_without_repairing(
         assert close_message.type in {WSMsgType.CLOSE, WSMsgType.CLOSED}
         assert old_ws.close_code == 4401
 
-        adapter._companion_api._idempotency.clear()
         adapter._companion_api._stores.clear()
         retried = await client.post(path, json=payload, headers=rotation_headers)
         assert retried.status == 200
@@ -1129,3 +1126,717 @@ def test_gateway_config_bridges_companion_block_without_env_vars(tmp_path, monke
         "operator_scopes": ["companion.pairing.create"],
         "trusted_loopback_proxy": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_create_and_redeem_idempotency_survive_process_restart(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    adapter, client = await make_client()
+    try:
+        create_headers = {
+            "Authorization": f"Bearer {API_KEY}",
+            "Idempotency-Key": "durable-create-0001",
+        }
+        created = await client.post(
+            "/companion/v1/pairing/invitations",
+            json={"deviceName": "Pixel"},
+            headers=create_headers,
+        )
+        assert created.status == 201
+        invitation = await created.json()
+
+        adapter._companion_api._stores.clear()
+        repeated_create = await client.post(
+            "/companion/v1/pairing/invitations",
+            json={"deviceName": "Pixel"},
+            headers=create_headers,
+        )
+        assert repeated_create.status == 201
+        assert await repeated_create.json() == invitation
+
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        payload = pairing_payload(invitation, private_key)
+        redeem_headers = {"Idempotency-Key": "durable-redeem-0001"}
+        redeemed = await client.post(
+            "/companion/v1/pairing/redeem",
+            json=payload,
+            headers=redeem_headers,
+        )
+        assert redeemed.status == 200
+        result = await redeemed.json()
+
+        adapter._companion_api._stores.clear()
+        repeated_redeem = await client.post(
+            "/companion/v1/pairing/redeem",
+            json=payload,
+            headers=redeem_headers,
+        )
+        assert repeated_redeem.status == 200
+        assert await repeated_redeem.json() == result
+
+        serialized_db = (tmp_path / ".hermes" / "state.db").read_bytes()
+        for secret in (
+            invitation["invitationCode"],
+            result["credentials"]["accessToken"],
+            result["credentials"]["refreshToken"],
+            create_headers["Idempotency-Key"],
+            redeem_headers["Idempotency-Key"],
+            payload["proof"]["signature"],
+            payload["devicePublicKey"]["material"],
+        ):
+            assert secret.encode() not in serialized_db
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_different_idempotency_keys_do_not_share_an_awaited_lock(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    adapter, client = await make_client()
+    release_slow = threading.Event()
+    try:
+        store = await adapter._companion_api._store()
+        original = store.create_invitation
+        slow_started = threading.Event()
+
+        def delayed_create(actor, device_name, **kwargs):
+            if device_name == "Slow":
+                slow_started.set()
+                assert release_slow.wait(timeout=2)
+            return original(actor, device_name, **kwargs)
+
+        monkeypatch.setattr(store, "create_invitation", delayed_create)
+        slow = asyncio.create_task(
+            client.post(
+                "/companion/v1/pairing/invitations",
+                json={"deviceName": "Slow"},
+                headers={
+                    "Authorization": f"Bearer {API_KEY}",
+                    "Idempotency-Key": "independent-slow-key",
+                },
+            )
+        )
+        assert await asyncio.to_thread(slow_started.wait, 1)
+        fast = await asyncio.wait_for(
+            client.post(
+                "/companion/v1/pairing/invitations",
+                json={"deviceName": "Fast"},
+                headers={
+                    "Authorization": f"Bearer {API_KEY}",
+                    "Idempotency-Key": "independent-fast-key",
+                },
+            ),
+            timeout=1,
+        )
+        assert fast.status == 201
+        release_slow.set()
+        assert (await slow).status == 201
+    finally:
+        release_slow.set()
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_revoke_idempotency_survives_restart_and_binds_fingerprint(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    adapter, client = await make_client()
+    try:
+        paired = await pair_device(
+            client, ec.generate_private_key(ec.SECP256R1()), suffix="durable-revoke"
+        )
+        path = f"/companion/v1/devices/{paired['device']['id']}/revoke"
+        headers = {
+            "Authorization": f"Bearer {API_KEY}",
+            "Idempotency-Key": "durable-device-revoke",
+        }
+        first = await client.post(path, json={"reason": "device_lost"}, headers=headers)
+        assert first.status == 200
+        original = await first.json()
+
+        adapter._companion_api._stores.clear()
+        repeated = await client.post(
+            path, json={"reason": "device_lost"}, headers=headers
+        )
+        assert repeated.status == 200
+        assert await repeated.json() == original
+
+        mismatch = await client.post(
+            path, json={"reason": "administrative"}, headers=headers
+        )
+        assert mismatch.status == 409
+        assert (await mismatch.json())["code"] == "conflict"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_device_and_session_lists_use_bounded_stable_cursor_pagination(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _adapter, client = await make_client()
+    try:
+        for index in range(3):
+            await pair_device(
+                client,
+                ec.generate_private_key(ec.SECP256R1()),
+                suffix=f"page-{index}",
+                nonce=f"pagination-nonce-{index}".encode(),
+            )
+
+        headers = {"Authorization": f"Bearer {API_KEY}"}
+        first = await client.get("/companion/v1/devices?limit=2", headers=headers)
+        assert first.status == 200
+        first_page = await first.json()
+        assert len(first_page["items"]) == 2
+        assert first_page["hasMore"] is True
+        assert isinstance(first_page["nextCursor"], str)
+
+        repeated = await client.get("/companion/v1/devices?limit=2", headers=headers)
+        assert await repeated.json() == first_page
+        second = await client.get(
+            "/companion/v1/devices",
+            params={"limit": "2", "cursor": first_page["nextCursor"]},
+            headers=headers,
+        )
+        second_page = await second.json()
+        assert second.status == 200
+        assert len(second_page["items"]) == 1
+        assert second_page["hasMore"] is False
+        assert "nextCursor" not in second_page
+        assert not (
+            {item["id"] for item in first_page["items"]}
+            & {item["id"] for item in second_page["items"]}
+        )
+
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / ".hermes" / "state.db")
+        try:
+            for index in range(3):
+                session_id = f"session_chat_{index}"
+                db.create_session(session_id, "cli")
+                assert db.set_session_title(session_id, f"Chat {index}")
+        finally:
+            db.close()
+
+        sessions = await client.get("/companion/v1/sessions?limit=2", headers=headers)
+        session_page = await sessions.json()
+        assert sessions.status == 200
+        assert len(session_page["items"]) == 2
+        assert session_page["hasMore"] is True
+        assert set(session_page["items"][0]) >= {
+            "id",
+            "title",
+            "createdAt",
+            "updatedAt",
+        }
+        assert "deviceId" not in session_page["items"][0]
+
+        for value in ("0", "101", "not-an-integer"):
+            invalid = await client.get(
+                "/companion/v1/devices", params={"limit": value}, headers=headers
+            )
+            assert invalid.status == 400
+            assert (await invalid.json())["code"] == "invalid_request"
+
+        tampered = first_page["nextCursor"][:-1] + (
+            "A" if first_page["nextCursor"][-1] != "A" else "B"
+        )
+        invalid_cursor = await client.get(
+            "/companion/v1/devices",
+            params={"cursor": tampered},
+            headers=headers,
+        )
+        assert invalid_cursor.status == 400
+        assert (await invalid_cursor.json())["code"] == "invalid_request"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_public_wil47_http_surface_matches_pinned_wil46_contract_profile(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    contract = CompanionContract()
+    _adapter, client = await make_client()
+    operator_headers = {"Authorization": f"Bearer {API_KEY}"}
+    try:
+        create_body = {"deviceName": "Pixel"}
+        created = await client.post(
+            "/companion/v1/pairing/invitations",
+            json=create_body,
+            headers={**operator_headers, "Idempotency-Key": "contract-create-001"},
+        )
+        assert created.status == 201
+        invitation = await contract.assert_exchange(
+            created,
+            "createPairingInvitation",
+            request_body=create_body,
+        )
+
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        redeem_body = pairing_payload(invitation, private_key)
+        redeemed = await client.post(
+            "/companion/v1/pairing/redeem",
+            json=redeem_body,
+            headers={"Idempotency-Key": "contract-redeem-001"},
+        )
+        assert redeemed.status == 200
+        pairing = await contract.assert_exchange(
+            redeemed,
+            "redeemPairingInvitation",
+            request_body=redeem_body,
+        )
+
+        bootstrap_path = "/companion/v1/bootstrap"
+        bootstrapped = await client.get(
+            bootstrap_path,
+            headers={
+                "Authorization": f"Bearer {pairing['credentials']['accessToken']}",
+                "DPoP": dpop(
+                    private_key,
+                    pairing["credentials"]["accessToken"],
+                    path=bootstrap_path,
+                    jti="contract-bootstrap",
+                ),
+            },
+        )
+        assert bootstrapped.status == 200
+        await contract.assert_exchange(bootstrapped, "getBootstrap")
+
+        refresh_path = "/companion/v1/auth/refresh"
+        refresh_body = {"refreshToken": pairing["credentials"]["refreshToken"]}
+        refreshed = await client.post(
+            refresh_path,
+            json=refresh_body,
+            headers={
+                "Idempotency-Key": "contract-refresh-001",
+                "DPoP": dpop(
+                    private_key,
+                    pairing["credentials"]["refreshToken"],
+                    path=refresh_path,
+                    jti="contract-refresh",
+                    method="POST",
+                ),
+            },
+        )
+        assert refreshed.status == 200
+        credentials = await contract.assert_exchange(
+            refreshed,
+            "refreshDeviceCredentials",
+            request_body=refresh_body,
+        )
+
+        # Seed enough real data to exercise both cursor and limit on both
+        # public list operations, not merely their component schemas.
+        await pair_device(
+            client,
+            ec.generate_private_key(ec.SECP256R1()),
+            suffix="contract-page-2",
+            nonce=b"contract-page-nonce",
+        )
+        devices_page_1 = await client.get(
+            "/companion/v1/devices",
+            params={"limit": "1"},
+            headers=operator_headers,
+        )
+        assert devices_page_1.status == 200
+        first_devices = await contract.assert_exchange(
+            devices_page_1,
+            "listPairedDevices",
+        )
+        assert first_devices["hasMore"] is True
+        devices_page_2 = await client.get(
+            "/companion/v1/devices",
+            params={"limit": "1", "cursor": first_devices["nextCursor"]},
+            headers=operator_headers,
+        )
+        assert devices_page_2.status == 200
+        second_devices = await contract.assert_exchange(
+            devices_page_2,
+            "listPairedDevices",
+        )
+        assert second_devices["items"]
+
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / ".hermes" / "state.db")
+        try:
+            for index in range(2):
+                session_id = f"session_contract_{index}"
+                db.create_session(session_id, "cli")
+                assert db.set_session_title(session_id, f"Contract {index}")
+        finally:
+            db.close()
+        sessions_page_1 = await client.get(
+            "/companion/v1/sessions",
+            params={"limit": "1"},
+            headers=operator_headers,
+        )
+        assert sessions_page_1.status == 200
+        first_sessions = await contract.assert_exchange(
+            sessions_page_1,
+            "listSessions",
+        )
+        assert first_sessions["hasMore"] is True
+        sessions_page_2 = await client.get(
+            "/companion/v1/sessions",
+            params={"limit": "1", "cursor": first_sessions["nextCursor"]},
+            headers=operator_headers,
+        )
+        assert sessions_page_2.status == 200
+        await contract.assert_exchange(sessions_page_2, "listSessions")
+
+        rotation_path = f"/companion/v1/devices/{credentials['deviceId']}/keys/rotate"
+        new_key = ec.generate_private_key(ec.SECP256R1())
+        rotation_body = rotation_payload(
+            credentials["deviceId"], credentials["keyId"], new_key
+        )
+        rotated = await client.post(
+            rotation_path,
+            json=rotation_body,
+            headers={
+                "Authorization": f"Bearer {credentials['accessToken']}",
+                "Idempotency-Key": "contract-rotation-001",
+                "DPoP": dpop(
+                    private_key,
+                    credentials["accessToken"],
+                    path=rotation_path,
+                    jti="contract-rotation",
+                    method="POST",
+                ),
+            },
+        )
+        assert rotated.status == 200
+        rotation = await contract.assert_exchange(
+            rotated,
+            "rotateDeviceKey",
+            request_body=rotation_body,
+            path_parameters={"deviceId": credentials["deviceId"]},
+        )
+
+        session_id = rotation["credentials"]["sessionId"]
+        session_revoke_body = {"reason": "administrative"}
+        session_revoked = await client.post(
+            f"/companion/v1/sessions/{session_id}/revoke",
+            json=session_revoke_body,
+            headers={
+                **operator_headers,
+                "Idempotency-Key": "contract-session-revoke-001",
+            },
+        )
+        assert session_revoked.status == 200
+        await contract.assert_exchange(
+            session_revoked,
+            "revokeSession",
+            request_body=session_revoke_body,
+            path_parameters={"sessionId": session_id},
+        )
+
+        revoke_body = {"reason": "administrative"}
+        revoked = await client.post(
+            f"/companion/v1/devices/{credentials['deviceId']}/revoke",
+            json=revoke_body,
+            headers={**operator_headers, "Idempotency-Key": "contract-revoke-001"},
+        )
+        assert revoked.status == 200
+        await contract.assert_exchange(
+            revoked,
+            "revokeDevice",
+            request_body=revoke_body,
+            path_parameters={"deviceId": credentials["deviceId"]},
+        )
+
+        # Exercise representative declared error responses through real HTTP.
+        missing_auth = await client.get("/companion/v1/bootstrap")
+        assert missing_auth.status == 401
+        await contract.assert_exchange(
+            missing_auth,
+            "getBootstrap",
+            validate_request=False,
+        )
+
+        invalid_header = await client.post(
+            "/companion/v1/pairing/invitations",
+            json=create_body,
+            headers={**operator_headers, "Idempotency-Key": "short"},
+        )
+        assert invalid_header.status == 400
+        await contract.assert_exchange(
+            invalid_header,
+            "createPairingInvitation",
+            request_body=create_body,
+            validate_request=False,
+        )
+
+        _no_scope_adapter, no_scope = await make_client(operator_scopes=[])
+        try:
+            forbidden = await no_scope.post(
+                "/companion/v1/pairing/invitations",
+                json=create_body,
+                headers={
+                    **operator_headers,
+                    "Idempotency-Key": "contract-forbidden-error",
+                },
+            )
+            assert forbidden.status == 403
+            await contract.assert_exchange(
+                forbidden,
+                "createPairingInvitation",
+                request_body=create_body,
+            )
+        finally:
+            await no_scope.close()
+
+        reuse_key = ec.generate_private_key(ec.SECP256R1())
+        reuse_pairing = await pair_device(
+            client,
+            reuse_key,
+            suffix="contract-refresh-reuse",
+            nonce=b"contract-reuse-nonce",
+        )
+        reused_token = reuse_pairing["credentials"]["refreshToken"]
+        reuse_body = {"refreshToken": reused_token}
+        first_refresh = await client.post(
+            refresh_path,
+            json=reuse_body,
+            headers={
+                "Idempotency-Key": "contract-reuse-first",
+                "DPoP": dpop(
+                    reuse_key,
+                    reused_token,
+                    path=refresh_path,
+                    jti="contract-reuse-first",
+                    method="POST",
+                ),
+            },
+        )
+        assert first_refresh.status == 200
+        second_refresh = await client.post(
+            refresh_path,
+            json=reuse_body,
+            headers={
+                "Idempotency-Key": "contract-reuse-second",
+                "DPoP": dpop(
+                    reuse_key,
+                    reused_token,
+                    path=refresh_path,
+                    jti="contract-reuse-second",
+                    method="POST",
+                ),
+            },
+        )
+        assert second_refresh.status == 409
+        await contract.assert_exchange(
+            second_refresh,
+            "refreshDeviceCredentials",
+            request_body=reuse_body,
+        )
+
+        legacy = await client.post(
+            "/companion/v1/pairing/complete",
+            json={"deviceName": "Pixel", "invitationCode": "obsolete"},
+            headers={"Idempotency-Key": "contract-legacy-error"},
+        )
+        assert legacy.status == 426
+        await contract.assert_exchange(
+            legacy,
+            "completePairingLegacy",
+            validate_request=False,
+        )
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "category", "retryable"),
+    [
+        (sqlite3.OperationalError("database is locked secret-token"), "locked", True),
+        (
+            sqlite3.DatabaseError("database disk image is malformed secret-token"),
+            "corrupt",
+            False,
+        ),
+        (PermissionError("state.db is read-only secret-token"), "unwritable", False),
+    ],
+)
+async def test_sqlite_failures_are_safely_classified_without_deleting_state(
+    tmp_path, monkeypatch, failure, category, retryable
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    adapter, client = await make_client()
+    try:
+        await pair_device(
+            client,
+            ec.generate_private_key(ec.SECP256R1()),
+            suffix=failure.__class__.__name__,
+        )
+        db_path = tmp_path / ".hermes" / "state.db"
+        before = db_path.read_bytes()
+
+        async def unavailable_store():
+            raise failure
+
+        monkeypatch.setattr(adapter._companion_api, "_store", unavailable_store)
+        response = await client.get(
+            "/companion/v1/devices",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+        )
+        assert response.status == 503
+        body = await response.json()
+        assert body["retryable"] is retryable
+        assert body["details"] == {
+            "readiness": "unavailable",
+            "outcome": "not_applicable",
+            "storageCategory": category,
+        }
+        CompanionContract().validate_schema("Error", body)
+        assert "secret-token" not in json.dumps(body)
+        assert db_path.read_bytes() == before
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_revocation_reports_commit_separately_from_websocket_close_timeout(
+    tmp_path, monkeypatch
+):
+    from gateway.companion_api import WebSocketCloseTimeout
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    adapter, client = await make_client()
+    try:
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        paired = await pair_device(client, private_key, suffix="close-timeout")
+        credentials = paired["credentials"]
+
+        async def close_timeout(**_kwargs):
+            raise WebSocketCloseTimeout
+
+        monkeypatch.setattr(adapter._companion_api, "_close_websockets", close_timeout)
+        response = await client.post(
+            f"/companion/v1/devices/{credentials['deviceId']}/revoke",
+            json={"reason": "device_lost"},
+            headers={
+                "Authorization": f"Bearer {API_KEY}",
+                "Idempotency-Key": "close-timeout-revoke",
+            },
+        )
+        assert response.status == 503
+        body = await response.json()
+        assert body["details"] == {
+            "readiness": "degraded",
+            "outcome": "committed",
+            "delivery": "websocket_close_timeout",
+        }
+        CompanionContract().validate_schema("Error", body)
+        denied = await client.get(
+            "/companion/v1/bootstrap",
+            headers={
+                "Authorization": f"Bearer {credentials['accessToken']}",
+                "DPoP": dpop(
+                    private_key,
+                    credentials["accessToken"],
+                    path="/companion/v1/bootstrap",
+                    jti="after-close-timeout",
+                ),
+            },
+        )
+        assert denied.status == 401
+        assert (await denied.json())["code"] in {"device_revoked", "session_revoked"}
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_in_flight_create_has_one_durable_owner(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _adapter, client = await make_client()
+    try:
+        headers = {
+            "Authorization": f"Bearer {API_KEY}",
+            "Idempotency-Key": "duplicate-in-flight-create",
+        }
+        first, second = await asyncio.gather(
+            client.post(
+                "/companion/v1/pairing/invitations",
+                json={"deviceName": "Pixel"},
+                headers=headers,
+            ),
+            client.post(
+                "/companion/v1/pairing/invitations",
+                json={"deviceName": "Pixel"},
+                headers=headers,
+            ),
+        )
+        assert first.status == second.status == 201
+        assert await first.json() == await second.json()
+        with sqlite3.connect(tmp_path / ".hermes" / "state.db") as conn:
+            assert (
+                conn.execute(
+                    "SELECT COUNT(*) FROM companion_pairing_invitations"
+                ).fetchone()[0]
+                == 1
+            )
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_owner_crash_before_commit_rolls_back_and_retry_takes_ownership(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    adapter, client = await make_client()
+    db_path = tmp_path / ".hermes" / "state.db"
+    try:
+        await adapter._companion_api._store()
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                """CREATE TRIGGER simulate_owner_crash
+                   BEFORE INSERT ON companion_operation_idempotency
+                   BEGIN SELECT RAISE(ABORT, 'simulated owner crash'); END"""
+            )
+        headers = {
+            "Authorization": f"Bearer {API_KEY}",
+            "Idempotency-Key": "owner-crash-create-key",
+        }
+        failed = await client.post(
+            "/companion/v1/pairing/invitations",
+            json={"deviceName": "Pixel"},
+            headers=headers,
+        )
+        assert failed.status == 503
+        with sqlite3.connect(db_path) as conn:
+            assert (
+                conn.execute(
+                    "SELECT COUNT(*) FROM companion_pairing_invitations"
+                ).fetchone()[0]
+                == 0
+            )
+            conn.execute("DROP TRIGGER simulate_owner_crash")
+
+        retried = await client.post(
+            "/companion/v1/pairing/invitations",
+            json={"deviceName": "Pixel"},
+            headers=headers,
+        )
+        assert retried.status == 201
+        with sqlite3.connect(db_path) as conn:
+            assert (
+                conn.execute(
+                    "SELECT COUNT(*) FROM companion_pairing_invitations"
+                ).fetchone()[0]
+                == 1
+            )
+    finally:
+        await client.close()
