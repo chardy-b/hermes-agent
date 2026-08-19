@@ -1414,6 +1414,14 @@ class APIServerAdapter(BasePlatformAdapter):
         self._direct_model_requests: bool = _coerce_request_bool(
             extra.get("direct_model_requests"), default=False
         )
+        self._companion_api = None
+        if AIOHTTP_AVAILABLE:
+            # Companion support is an edge HTTP capability, not a model tool.
+            # Keep its crypto/storage implementation out of this already-large
+            # adapter and activate it only through config.yaml.
+            from gateway.companion_api import CompanionAPI
+
+            self._companion_api = CompanionAPI(self, extra.get("companion"))
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
@@ -2097,6 +2105,8 @@ class APIServerAdapter(BasePlatformAdapter):
             # Chronos managed-cron fire webhook (NAS → agent). Authenticated
             # by a NAS-minted JWT (NOT API_SERVER_KEY).
             routes.append(("POST", "/api/cron/fire", self._handle_cron_fire))
+        if self._companion_api is not None:
+            routes.extend(self._companion_api.routes())
         return routes
 
     # ------------------------------------------------------------------
