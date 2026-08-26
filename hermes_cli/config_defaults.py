@@ -3407,11 +3407,14 @@ DEFAULT_CONFIG = {
         #   "update_in_place"   — for a deliberately maintained custom branch
         #                         (local patches on top of main): merge
         #                         origin/<target> INTO the branch instead.
-        #                         The checkout never moves and local commits
-        #                         survive; a conflict stops the update
-        #                         cleanly with nothing changed. A safety tag
-        #                         (pre-update-<stamp>) is left before the
-        #                         merge. `hermes update --switch-branch`
+        #                         A checkout with an explicit ``fork`` remote
+        #                         uses this safe in-place path automatically;
+        #                         this setting enables it for custom branches
+        #                         without that remote. The checkout never moves
+        #                         and local commits survive; a conflict stops
+        #                         the update cleanly with nothing changed. A
+        #                         safety tag (pre-update-<stamp>) is left before
+        #                         the merge. `hermes update --switch-branch`
         #                         overrides back to the switch path for one
         #                         run (e.g. a deep feature branch that must
         #                         not accumulate update merge commits).
