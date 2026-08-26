@@ -48,7 +48,8 @@ jobs:
             runner: macos-latest
             marker: macos_only
           - name: Windows-only tests
-            runner: windows-latest-32-core
+            # The 32-core Windows label is not provisioned for this fork.
+            runner: windows-latest
             marker: windows_only
     steps:
       - name: Checkout code
