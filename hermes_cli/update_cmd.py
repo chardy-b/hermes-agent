@@ -1125,6 +1125,33 @@ def _assess_parked_branch_switch(
     return True, ""
 
 
+def _has_official_origin_and_fork_remote(git_cmd: list[str], cwd: Path) -> bool:
+    """Whether this is an explicitly declared Hermes fork checkout.
+
+    A ``fork`` remote alone is not enough: an unrelated repository can use
+    that remote name. Require ``origin`` to be the official Hermes repository,
+    then treat the named fork as an opt-in to merge stable into the current
+    custom branch. This only inspects Git configuration; it cannot mutate the
+    working tree. Missing or unreadable remotes fail closed to the historical
+    switch behavior.
+    """
+    origin_url = _get_origin_url(git_cmd, cwd)
+    if not origin_url or _is_fork(origin_url):
+        return False
+    try:
+        result = subprocess.run(
+            git_cmd + ["remote", "get-url", "fork"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError:
+        return False
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
 def _print_parked_branch_skip_warning(
     git_cmd: list[str],
     cwd: Path,
@@ -6144,23 +6171,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
     if sys.platform == "win32":
         git_cmd = ["git", "-c", "windows.appendAtomically=false"]
 
-    # Discard npm lockfile churn before any stash/branch logic. npm rewrites
-    # tracked package-lock.json files non-deterministically at install/build
-    # time (platform-specific optional deps, ideallyInert annotations, etc.),
-    # which is never an intentional edit on a managed install but leaves the
-    # tree dirty — forcing an autostash on every update and making branch
-    # switches fragile. Restoring them first lets the common case (only
-    # lockfile churn) update with a clean tree.
-    _discard_lockfile_churn(git_cmd, _m().PROJECT_ROOT)
-    # Same rationale, different generator: line-ending churn is machine-made
-    # dirt on a managed checkout, so clear it (and stop generating it) before
-    # the stash/branch logic rather than autostashing the entire tree.
-    _normalize_managed_eol(git_cmd, _m().PROJECT_ROOT)
-
-    # Detect if we're updating from a fork (before any branch logic)
     origin_url = _m()._get_origin_url(git_cmd, _m().PROJECT_ROOT)
     is_fork = _is_fork(origin_url)
-
+    fork_aware_checkout = _has_official_origin_and_fork_remote(
+        git_cmd, _m().PROJECT_ROOT
+    )
+    if not fork_aware_checkout:
+        _discard_lockfile_churn(git_cmd, _m().PROJECT_ROOT)
+        _normalize_managed_eol(git_cmd, _m().PROJECT_ROOT)
     if is_fork:
         print("⚠ Updating from fork:")
         print(f"  {origin_url}")
@@ -6271,20 +6289,22 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 )
                 sys.exit(1)
             if switch_block_reason.startswith("unmerged:"):
-                _in_place_configured = False
-                try:
-                    from hermes_cli.config import load_config as _load_cfg
+                _in_place_configured = fork_aware_checkout
+                _fork_aware_in_place = _in_place_configured
+                if not _in_place_configured:
+                    try:
+                        from hermes_cli.config import load_config as _load_cfg
 
-                    _upd_cfg = (_load_cfg() or {}).get("updates", {})
-                    _in_place_configured = (
-                        isinstance(_upd_cfg, dict)
-                        and _upd_cfg.get("parked_branch_strategy", "switch")
-                        == "update_in_place"
-                    )
-                except Exception as exc:
-                    logger.debug(
-                        "Could not read updates.parked_branch_strategy: %s", exc
-                    )
+                        _upd_cfg = (_load_cfg() or {}).get("updates", {})
+                        _in_place_configured = (
+                            isinstance(_upd_cfg, dict)
+                            and _upd_cfg.get("parked_branch_strategy", "switch")
+                            == "update_in_place"
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "Could not read updates.parked_branch_strategy: %s", exc
+                        )
                 if _in_place_configured and not switch_branch:
                     # The merge source must exist upstream; --branch typos
                     # previously surfaced through the checkout failing, which
@@ -6299,10 +6319,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         print(f"✗ Branch '{branch}' does not exist locally or on origin.")
                         sys.exit(1)
                     in_place_update = True
-                    print(
-                        f"  ℹ On branch '{current_branch}' — updating it in place from "
-                        f"origin/{branch} (no branch switch; local commits preserved)."
-                    )
+                    if _fork_aware_in_place:
+                        print(
+                            f"  ℹ Fork-aware in-place update: merging origin/{branch} into "
+                            f"'{current_branch}' (no branch switch; local commits preserved)."
+                        )
+                    else:
+                        print(
+                            f"  ℹ On branch '{current_branch}' — updating it in place from "
+                            f"origin/{branch} (no branch switch; local commits preserved)."
+                        )
                 else:
                     parked_branch_switched = True
                     _m()._print_parked_branch_kept_notice(
