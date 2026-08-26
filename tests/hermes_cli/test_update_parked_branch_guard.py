@@ -255,7 +255,12 @@ def _patch_update_flow(monkeypatch, repo, run_real_git=True):
         hermes_main, "_get_origin_url",
         lambda *a, **k: "https://github.com/NousResearch/hermes-agent.git",
     )
-    monkeypatch.setattr(hermes_main, "_is_fork", lambda *a, **k: False)
+    monkeypatch.setattr(
+        update_cmd,
+        "_get_origin_url",
+        lambda *a, **k: "https://github.com/NousResearch/hermes-agent.git",
+    )
+    monkeypatch.setattr(update_cmd, "_is_fork", lambda *a, **k: False)
     monkeypatch.setattr(hermes_main, "_discard_lockfile_churn", lambda *a, **k: None)
     monkeypatch.setattr(update_cmd, "_discard_lockfile_churn", lambda *a, **k: None)
     monkeypatch.setattr(update_cmd, "_normalize_managed_eol", lambda *a, **k: None)
@@ -393,6 +398,127 @@ def test_update_updates_unmerged_branch_in_place_when_configured(
     # ...and the branch's own commit survived it.
     assert (repo_pair / "feature.txt").read_text() == "unmerged work\n"
     assert "feature work" in _git(repo_pair, "log", "--oneline").stdout
+
+
+def test_named_fork_remote_requires_official_origin(repo_pair):
+    """An unrelated checkout that happens to name a remote ``fork`` keeps the
+    historical branch-switch strategy."""
+    _git(repo_pair, "remote", "add", "fork", str(repo_pair.parent / "fork"))
+
+    assert update_cmd._has_official_origin_and_fork_remote(GIT, repo_pair) is False
+
+
+def test_update_detects_fork_remote_and_updates_custom_branch_in_place(
+    repo_pair, monkeypatch, capsys
+):
+    """A checkout with official ``origin`` plus a user ``fork`` remote is a
+    maintained fork even without a local config override. ``hermes update``
+    must merge stable into its checked-out custom branch, never switch it.
+    """
+    _git(repo_pair, "remote", "add", "fork", str(repo_pair.parent / "fork"))
+    (repo_pair / "feature.txt").write_text("fork-owned change\n")
+    _git(repo_pair, "add", "feature.txt")
+    _git(repo_pair, "commit", "-qm", "fork-owned change")
+    _patch_update_flow(monkeypatch, repo_pair)
+
+    class _StopFlow(Exception):
+        pass
+
+    monkeypatch.setattr(
+        hermes_main,
+        "_abort_dependency_sync_if_self_locked",
+        lambda *a, **k: (_ for _ in ()).throw(_StopFlow()),
+    )
+    args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
+
+    with pytest.raises(_StopFlow):
+        hermes_main.cmd_update(args)
+
+    out = capsys.readouterr().out
+    assert "Fork-aware in-place update" in out
+    assert (
+        _git(repo_pair, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        == "old-feature"
+    )
+    assert (repo_pair / "b.txt").exists()
+    assert (repo_pair / "feature.txt").read_text() == "fork-owned change\n"
+
+
+def test_fork_aware_update_preserves_tracked_dirty_changes_before_cleanup(
+    repo_pair, monkeypatch, capsys
+):
+    """Fork-aware mode classifies tracked edits before any cleanup helper can
+    normalize or discard them."""
+    _git(repo_pair, "remote", "add", "fork", str(repo_pair.parent / "fork"))
+    (repo_pair / "a.txt").write_text("user-owned tracked edit\n")
+    _patch_update_flow(monkeypatch, repo_pair)
+    monkeypatch.setattr(
+        update_cmd,
+        "_discard_lockfile_churn",
+        lambda *a, **k: pytest.fail("fork-aware update ran cleanup before dirty check"),
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "_normalize_managed_eol",
+        lambda *a, **k: pytest.fail("fork-aware update ran cleanup before dirty check"),
+    )
+    args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
+
+    with pytest.raises(SystemExit) as exc_info:
+        hermes_main.cmd_update(args)
+
+    assert exc_info.value.code == 1
+    assert "uncommitted changes" in capsys.readouterr().out
+    assert (repo_pair / "a.txt").read_text() == "user-owned tracked edit\n"
+    assert _git(repo_pair, "stash", "list").stdout.strip() == ""
+
+
+def test_fork_aware_update_aborts_merge_conflicts_without_changing_branch(
+    repo_pair, monkeypatch, capsys
+):
+    """A conflict leaves the custom branch at its pre-update commit and a
+    clean worktree; the user can recover from the safety tag if needed."""
+    _git(repo_pair, "remote", "add", "fork", str(repo_pair.parent / "fork"))
+    (repo_pair / "a.txt").write_text("fork version\n")
+    _git(repo_pair, "commit", "-am", "fork conflicts with upstream")
+    before = _git(repo_pair, "rev-parse", "HEAD").stdout.strip()
+    _patch_update_flow(monkeypatch, repo_pair)
+    args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
+
+    with pytest.raises(SystemExit) as exc_info:
+        hermes_main.cmd_update(args)
+
+    assert exc_info.value.code == 1
+    assert "Merge conflict" in capsys.readouterr().out
+    assert _git(repo_pair, "rev-parse", "HEAD").stdout.strip() == before
+    assert _git(repo_pair, "status", "--porcelain").stdout.strip() == ""
+    assert _git(repo_pair, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "old-feature"
+    assert _git(repo_pair, "tag", "--list", "pre-update-*").stdout.strip()
+
+
+def test_fork_aware_update_refuses_dirty_tree_before_stashing(
+    repo_pair, monkeypatch, capsys
+):
+    """Fork-aware mode must inspect tracked and untracked edits before it
+    decides to merge. It must not stash, switch, or write a merge commit.
+    """
+    _git(repo_pair, "remote", "add", "fork", str(repo_pair.parent / "fork"))
+    (repo_pair / "local-wip.txt").write_text("uncommitted\n")
+    _patch_update_flow(monkeypatch, repo_pair)
+    args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
+
+    with pytest.raises(SystemExit) as exc_info:
+        hermes_main.cmd_update(args)
+
+    assert exc_info.value.code == 1
+    out = capsys.readouterr().out
+    assert "CODE UPDATE SKIPPED" in out
+    assert "uncommitted changes" in out
+    assert (
+        _git(repo_pair, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        == "old-feature"
+    )
+    assert _git(repo_pair, "stash", "list").stdout.strip() == ""
 
 
 def test_switch_branch_flag_overrides_in_place_strategy(
