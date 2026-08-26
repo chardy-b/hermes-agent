@@ -12,7 +12,11 @@ import threading
 from pathlib import Path, PurePosixPath
 
 from agent.file_safety import get_read_block_error
-from tools.binary_extensions import has_binary_extension
+from tools.binary_extensions import (
+    has_binary_extension,
+    has_opaque_document_extension,
+    is_pdf_path,
+)
 from tools.file_operations import (
     ShellFileOperations,
     normalize_read_pagination,
@@ -198,6 +202,9 @@ def _terminal_env_type_for_task(task_id: str = "default") -> str:
                 return "modal"
             if "daytona" in name:
                 return "daytona"
+            stamped = getattr(env, "_hermes_backend_name", None)
+            if isinstance(stamped, str) and stamped:
+                return stamped
         cfg = _get_env_config()
         return str(cfg.get("env_type") or os.getenv("TERMINAL_ENV") or "local").lower()
     except Exception:
@@ -205,12 +212,13 @@ def _terminal_env_type_for_task(task_id: str = "default") -> str:
 
 
 def _uses_container_paths(task_id: str = "default") -> bool:
+    env_type = _terminal_env_type_for_task(task_id)
     try:
-        from tools.terminal_tool import _CONTAINER_BACKENDS
-        container_backends = _CONTAINER_BACKENDS
+        from tools.terminal_tool import _is_container_backend
+
+        return _is_container_backend(env_type)
     except Exception:
-        container_backends = _CONTAINER_PATH_BACKENDS_FALLBACK
-    return _terminal_env_type_for_task(task_id) in container_backends
+        return env_type in _CONTAINER_PATH_BACKENDS_FALLBACK
 
 
 def _normalize_without_host_deref(path: str | Path | PurePosixPath) -> PurePosixPath:
@@ -912,6 +920,7 @@ def _request_protected_instruction_approval(
         choice = _approval.prompt_dangerous_approval(
             display, description,
             allow_permanent=False,
+            allow_session=False,
             approval_callback=callback,
         )
         if choice in {"once", "session", "always"}:
@@ -1004,6 +1013,11 @@ def _check_approval_required_write(paths: list[str],
         display_target=f"<write to {display_targets}>",
         cron_deny_message=blocked.format(
             why="requires approval but this cron session denies it."),
+        single_query_deny_message=blocked.format(
+            why="requires approval but single-query (-q) sessions run "
+                "without a user present to approve it. To allow flagged "
+                "actions in single-query mode, set approvals.single_query_mode: "
+                "approve in config.yaml."),
         autoapprove_log_prefix="ssh_config_write",
         fail_closed_when_no_human=True,
         no_human_block_message=blocked.format(
@@ -1437,11 +1451,21 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                 # (fixes #26211: silent file-creation failures in long-running
                 # conversations). Usually a no-op: every completed command
                 # already recorded its cwd.
+                #
+                # Fill-only: ``cached.cwd`` is a snapshot of the SHARED env's
+                # cwd at cache-build time, so it is not attributable to this
+                # session (same class as the interrupted-command bug, #85658).
+                # Rescue a session that has no record, but never overwrite a
+                # record the session wrote for itself.
                 old_cwd = getattr(cached, "cwd", None)
                 if old_cwd:
                     try:
-                        from tools.terminal_tool import record_session_cwd
-                        record_session_cwd(raw_task_id, old_cwd)
+                        from tools.terminal_tool import (
+                            get_session_cwd,
+                            record_session_cwd,
+                        )
+                        if get_session_cwd(raw_task_id) is None:
+                            record_session_cwd(raw_task_id, old_cwd)
                     except Exception:
                         pass
                 with _file_ops_lock:
@@ -1510,7 +1534,9 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             logger.info("Creating new %s environment for task %s...", env_type, task_id[:8])
 
             container_config = None
-            if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}:
+            from tools.terminal_tool import _is_container_backend as _is_container
+
+            if _is_container(env_type):
                 container_config = {
                     "container_cpu": config.get("container_cpu", 1),
                     "container_memory": config.get("container_memory", 5120),
@@ -2160,6 +2186,51 @@ def _mark_verification_stale(
         logger.debug("verification stale marker failed", exc_info=True)
 
 
+def _check_binary_document_write(filepath: str, task_id: str = "default") -> str | None:
+    """Reject text-tool writes that would corrupt a binary document.
+
+    ``read_file`` auto-extracts .docx/.xlsx/.pptx (and PDF, via anydoc) to
+    readable text, so the model plausibly believes it holds the file's
+    contents and tries to write the edited text back with write_file/patch.
+    A plain-text write can never produce a valid OOXML/OLE/ODF container, so
+    that write silently destroys the document (port of nearai/ironclaw#7109).
+
+    Rules:
+    - Opaque container formats (.doc/.docx/.xls/.xlsx/.ppt/.pptx/.odt/.ods/
+      .odp): always rejected — text bytes are never a valid document, whether
+      creating or overwriting.
+    - .pdf: rejected only when OVERWRITING an existing regular file. Raw PDF
+      syntax is text-authorable, so new-file creation stays allowed.
+    """
+    if has_opaque_document_extension(filepath):
+        ext = filepath[filepath.rfind("."):].lower()
+        return (
+            f"Refusing to write plain text to binary document '{filepath}' ({ext}). "
+            "A text write cannot produce a valid document container and would "
+            "corrupt the file (read_file showed you EXTRACTED text, not the real "
+            "bytes). Use the docx/xlsx/powerpoint skills or a library like "
+            "python-docx/openpyxl/python-pptx via the terminal to create or edit "
+            "this document."
+        )
+    if is_pdf_path(filepath):
+        try:
+            resolved = Path(_resolve_path_for_task(filepath, task_id))
+        except Exception:
+            resolved = Path(_expand_tilde(filepath))
+        try:
+            if resolved.is_file():
+                return (
+                    f"Refusing to overwrite existing PDF '{filepath}' with plain text. "
+                    "read_file showed you EXTRACTED text, not the real bytes — writing "
+                    "text back would destroy the document. Use the pdf skill or a PDF "
+                    "library via the terminal to modify it. (Creating a NEW .pdf file "
+                    "is allowed.)"
+                )
+        except OSError:
+            pass
+    return None
+
+
 def write_file_tool(path: str, content: str, task_id: str = "default",
                     cross_profile: bool = False,
                     session_id: str | None = None) -> str:
@@ -2174,6 +2245,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
+    binary_doc_err = _check_binary_document_write(path, task_id)
+    if binary_doc_err:
+        return tool_error(binary_doc_err)
     protected_err = _check_protected_instruction_write([path], task_id)
     if protected_err:
         return tool_error(protected_err)
@@ -2261,8 +2335,12 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
     """
     # Check sensitive paths for both replace (explicit path) and V4A patch (extract paths)
     _paths_to_check = []
+    # Paths whose CONTENT will be text-written (Update/Add + explicit path).
+    # V4A Delete/Move don't write text, so they skip the binary-document guard.
+    _content_write_paths = []
     if path:
         _paths_to_check.append(path)
+        _content_write_paths.append(path)
     if mode == "patch" and patch:
         import re as _re
         from tools.path_security import has_traversal_component
@@ -2288,12 +2366,15 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         # it accepts ``***Update File:`` with no space after the asterisks
         # (patch_parser.py uses ``\*\*\*\s*Update\s+File:``). Requiring a space
         # here let a no-space header parse + apply while skipping this check.
-        for _m in _re.finditer(r'^\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
-            v4a_path = _m.group(1).strip()
+        for _m in _re.finditer(r'^\*\*\*\s*(Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
+            _op = _m.group(1)
+            v4a_path = _m.group(2).strip()
             _err = _reject_v4a_traversal(v4a_path)
             if _err:
                 return _err
             _paths_to_check.append(v4a_path)
+            if _op in ("Update", "Add"):
+                _content_write_paths.append(v4a_path)
         # ``*** Move File: src -> dst`` is a valid V4A op (patch_parser.py:114)
         # but was never extracted, so a Move targeting /etc/crontab skipped the
         # sensitive-path pre-check. Check BOTH endpoints, and run them through
@@ -2312,6 +2393,10 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             cross_warning = _check_cross_profile_path(_p, task_id)
             if cross_warning:
                 return tool_error(cross_warning)
+    for _p in _content_write_paths:
+        binary_doc_err = _check_binary_document_write(_p, task_id)
+        if binary_doc_err:
+            return tool_error(binary_doc_err)
     # One approval prompt for the whole patch: a single protected file gates
     # the ENTIRE patch (deny applies nothing — see the helper's docstring).
     protected_err = _check_protected_instruction_write(_paths_to_check, task_id)
