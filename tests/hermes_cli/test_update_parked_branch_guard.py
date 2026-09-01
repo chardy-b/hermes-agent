@@ -496,6 +496,36 @@ def test_fork_aware_update_aborts_merge_conflicts_without_changing_branch(
     assert _git(repo_pair, "tag", "--list", "pre-update-*").stdout.strip()
 
 
+def test_fork_aware_update_reports_failed_conflict_recovery(repo_pair, monkeypatch, capsys):
+    """If ``git merge --abort`` fails, do not claim the checkout is untouched.
+
+    The real merge creates a conflict; only the recovery command is injected
+    as failed so the update command must expose the recovery ref and stop.
+    """
+    _git(repo_pair, "remote", "add", "fork", str(repo_pair.parent / "fork"))
+    (repo_pair / "a.txt").write_text("fork version\n")
+    _git(repo_pair, "commit", "-am", "fork conflicts with upstream")
+    _patch_update_flow(monkeypatch, repo_pair)
+    real_run = subprocess.run
+
+    def fail_merge_abort(command, *args, **kwargs):
+        if command[-2:] == ["merge", "--abort"]:
+            return subprocess.CompletedProcess(command, 1, "", "abort failed")
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(update_cmd.subprocess, "run", fail_merge_abort)
+    args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
+
+    with pytest.raises(SystemExit) as exc_info:
+        hermes_main.cmd_update(args)
+
+    assert exc_info.value.code == 1
+    out = capsys.readouterr().out
+    assert "recovery failed" in out
+    assert "pre-update-" in out
+    assert "nothing was changed" not in out
+
+
 def test_fork_aware_update_refuses_dirty_tree_before_stashing(
     repo_pair, monkeypatch, capsys
 ):

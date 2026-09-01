@@ -8983,13 +8983,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         f"  ⚠ Checkout is on custom branch '{_cur_branch}' — "
                         f"merging origin/{branch} instead of resetting so local commits survive..."
                     )
-                    # Best-effort safety tag; recovery anchor if anything goes wrong.
-                    subprocess.run(
-                        git_cmd
-                        + ["tag", f"pre-update-{_time.strftime('%Y%m%d-%H%M%S')}"],
+                    # Create a recovery anchor before attempting a merge. If
+                    # recovery itself fails, this is the last known-good state.
+                    recovery_tag = f"pre-update-{_time.strftime('%Y%m%d-%H%M%S')}"
+                    tag_result = subprocess.run(
+                        git_cmd + ["tag", recovery_tag],
                         cwd=_m().PROJECT_ROOT,
                         capture_output=True,
-                        check=False,
+                        text=True, encoding="utf-8", errors="replace",
                     )
                     merge_result = subprocess.run(
                         git_cmd + ["merge", "--no-edit", f"origin/{branch}"],
@@ -8998,12 +8999,31 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         text=True, encoding="utf-8", errors="replace",
                     )
                     if merge_result.returncode != 0:
-                        subprocess.run(
+                        abort_result = subprocess.run(
                             git_cmd + ["merge", "--abort"],
                             cwd=_m().PROJECT_ROOT,
                             capture_output=True,
-                            check=False,
+                            text=True, encoding="utf-8", errors="replace",
                         )
+                        if abort_result.returncode != 0:
+                            print(
+                                "✗ Merge conflict and automatic recovery failed — "
+                                "the checkout may still be conflicted."
+                            )
+                            if tag_result.returncode == 0:
+                                print(
+                                    f"  Recovery anchor: {recovery_tag}. "
+                                    f"Restore with: git reset --merge {recovery_tag}"
+                                )
+                            else:
+                                print(
+                                    f"  Recovery anchor could not be created; "
+                                    f"inspect the checkout before retrying."
+                                )
+                            print(
+                                f"  First try: cd {_m().PROJECT_ROOT} && git merge --abort"
+                            )
+                            sys.exit(1)
                         print(
                             "✗ Merge conflict between local commits and upstream — "
                             "update stopped, nothing was changed."
