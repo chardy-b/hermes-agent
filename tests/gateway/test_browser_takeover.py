@@ -52,11 +52,15 @@ class RecordingAdapter(BrowserViewerAdapter):
         return ViewerBinding(
             adapter_id=self.adapter_id,
             viewer_session_id="viewer-a",
+            browser_profile_id=scope.browser_profile_id,
+            browser_session_id=scope.browser_session_id,
+            transport_family=scope.transport_family,
             display_id=":91",
             dedicated_display=self.dedicated,
             cdp_endpoint=f"http://{self.host}:9222",
             vnc_endpoint=f"vnc://{self.host}:5901",
             novnc_endpoint=f"http://{self.host}:6081/vnc.html",
+            novnc_websocket_endpoint=f"ws://{self.host}:6081/websockify",
             initial_observation=BrowserObservation(
                 state="still_blocked",
                 active_tab_id="tab-a",
@@ -196,11 +200,19 @@ def test_acquire_rejects_shared_display_or_non_loopback_listener():
                 novnc_endpoint="http://127.0.0.1:6081/admin",
             )
 
+    class WrongScopeAdapter(RecordingAdapter):
+        def acquire(self, scope):
+            return replace(
+                super().acquire(scope),
+                browser_profile_id="other-browser-profile",
+            )
+
     for adapter in (
         RecordingAdapter(dedicated=False),
         RecordingAdapter(host="localhost"),
         RecordingAdapter(host="192.0.2.10"),
         WrongPathAdapter(),
+        WrongScopeAdapter(),
     ):
         coordinator = BrowserTakeoverCoordinator()
         with pytest.raises(TakeoverSecurityError):

@@ -98,11 +98,15 @@ class ViewerBinding:
 
     adapter_id: str
     viewer_session_id: str
+    browser_profile_id: str
+    browser_session_id: str
+    transport_family: str
     display_id: str
     dedicated_display: bool
     cdp_endpoint: str
     vnc_endpoint: str
     novnc_endpoint: str
+    novnc_websocket_endpoint: str
     initial_observation: BrowserObservation
 
     def __repr__(self) -> str:
@@ -147,6 +151,22 @@ class TakeoverCompletionReport:
     outcome: str
     continuity_verified: bool
     active_tab_id: str
+
+
+@dataclass(frozen=True, repr=False)
+class ViewerProxyTarget:
+    """Private exact noVNC upstream used only by the authenticated proxy."""
+
+    adapter_id: str
+    viewer_session_id: str
+    http_url: str
+    websocket_url: str
+
+    def __repr__(self) -> str:
+        return (
+            "ViewerProxyTarget("
+            f"adapter_id={self.adapter_id!r}, viewer_session_id=<redacted>)"
+        )
 
 
 @dataclass
@@ -219,7 +239,11 @@ class BrowserTakeoverCoordinator:
         binding: Optional[ViewerBinding] = None
         try:
             binding = adapter.acquire(scope)
-            self._validate_binding(binding, expected_adapter_id=adapter.adapter_id)
+            self._validate_binding(
+                binding,
+                expected_adapter_id=adapter.adapter_id,
+                expected_scope=scope,
+            )
             with self._lock:
                 if (
                     record.generation != self._generation
@@ -439,6 +463,30 @@ class BrowserTakeoverCoordinator:
             expired.append(lease_id)
         return tuple(expired)
 
+    def viewer_proxy_target(
+        self, lease_id: str, scope: TakeoverScope
+    ) -> ViewerProxyTarget:
+        """Return the private noVNC target for one exact active human lease."""
+        self.expire_due(
+            hermes_session_id=scope.hermes_session_id,
+            browser_session_id=scope.browser_session_id,
+        )
+        with self._lock:
+            record = self._leases.get(lease_id)
+            if record is None:
+                raise TakeoverNotFound("takeover lease not found")
+            if record.grant.scope != scope:
+                raise TakeoverScopeMismatch("takeover scope does not exactly match")
+            if record.ownership != "human" or record.binding is None:
+                raise TakeoverConflict("takeover viewer is not active")
+            binding = record.binding
+            return ViewerProxyTarget(
+                adapter_id=record.grant.adapter_id,
+                viewer_session_id=binding.viewer_session_id,
+                http_url=binding.novnc_endpoint,
+                websocket_url=binding.novnc_websocket_endpoint,
+            )
+
     def _expire_lease(self, lease_id: str) -> TakeoverCompletionReport:
         with self._lock:
             record = self._leases.get(lease_id)
@@ -549,12 +597,25 @@ class BrowserTakeoverCoordinator:
         )
 
     @staticmethod
-    def _validate_binding(binding: ViewerBinding, *, expected_adapter_id: str) -> None:
+    def _validate_binding(
+        binding: ViewerBinding,
+        *,
+        expected_adapter_id: str,
+        expected_scope: TakeoverScope,
+    ) -> None:
         if not isinstance(binding, ViewerBinding):
             raise TakeoverSecurityError("viewer adapter returned an invalid binding")
         if binding.adapter_id != expected_adapter_id:
             raise TakeoverSecurityError(
                 "viewer binding adapter identity does not match"
+            )
+        if (
+            binding.browser_profile_id != expected_scope.browser_profile_id
+            or binding.browser_session_id != expected_scope.browser_session_id
+            or binding.transport_family != expected_scope.transport_family
+        ):
+            raise TakeoverSecurityError(
+                "viewer binding browser scope does not exactly match"
             )
         if not binding.viewer_session_id or not binding.display_id:
             raise TakeoverSecurityError("viewer binding identity is incomplete")
@@ -564,6 +625,11 @@ class BrowserTakeoverCoordinator:
             ("CDP", binding.cdp_endpoint, {"http", "https", "ws", "wss"}),
             ("VNC", binding.vnc_endpoint, {"vnc", "tcp"}),
             ("noVNC", binding.novnc_endpoint, {"http", "https", "ws", "wss"}),
+            (
+                "noVNC WebSocket",
+                binding.novnc_websocket_endpoint,
+                {"ws", "wss"},
+            ),
         ):
             parsed = urlsplit(endpoint)
             if (
@@ -589,6 +655,8 @@ class BrowserTakeoverCoordinator:
                 "/vnc_lite.html",
             }:
                 raise TakeoverSecurityError("noVNC listener path is not allowed")
+            if label == "noVNC WebSocket" and parsed.path != "/websockify":
+                raise TakeoverSecurityError("noVNC WebSocket path is not allowed")
             if label == "CDP" and not (
                 parsed.path in {"", "/"}
                 or parsed.path.startswith("/json/")

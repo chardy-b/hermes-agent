@@ -1553,6 +1553,7 @@ class APIServerAdapter(BasePlatformAdapter):
             extra.get("direct_model_requests"), default=False
         )
         self._companion_api = None
+        self._browser_takeover_api = None
         if AIOHTTP_AVAILABLE:
             # Companion support is an edge HTTP capability, not a model tool.
             # Keep its crypto/storage implementation out of this already-large
@@ -1560,6 +1561,25 @@ class APIServerAdapter(BasePlatformAdapter):
             from gateway.companion_api import CompanionAPI
 
             self._companion_api = CompanionAPI(self, extra.get("companion"))
+            takeover_config = extra.get("browser_takeover")
+            if isinstance(takeover_config, dict) and takeover_config.get("enabled") is True:
+                from gateway.browser_takeover import get_browser_takeover_coordinator
+                from gateway.browser_takeover_access import TakeoverAccessManager
+                from gateway.browser_takeover_api import BrowserTakeoverAPI
+
+                public_origin = str(takeover_config.get("public_origin") or "").strip()
+                try:
+                    access = TakeoverAccessManager(
+                        get_browser_takeover_coordinator(),
+                        base_url=public_origin,
+                    )
+                except ValueError:
+                    logger.error(
+                        "[%s] browser takeover disabled: an origin-only HTTPS public_origin is required",
+                        self.name,
+                    )
+                else:
+                    self._browser_takeover_api = BrowserTakeoverAPI(access)
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
@@ -2277,6 +2297,15 @@ class APIServerAdapter(BasePlatformAdapter):
             routes.append(("POST", "/api/cron/fire", self._handle_cron_fire))
         if self._companion_api is not None:
             routes.extend(self._companion_api.routes())
+        if self._browser_takeover_api is not None:
+            routes.append(
+                (
+                    "POST",
+                    "/v1/browser-takeover/issue",
+                    self._handle_browser_takeover_issue,
+                )
+            )
+            routes.extend(self._browser_takeover_api.routes())
         return routes
 
     # ------------------------------------------------------------------
@@ -3560,6 +3589,123 @@ class APIServerAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # Browser-extension control (authenticated local/VPS API)
     # ------------------------------------------------------------------
+
+    async def _handle_browser_takeover_issue(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """Mint one exact-scope claim through the authenticated API surface."""
+        if self._browser_takeover_api is None:
+            raise web.HTTPNotFound()
+        if not self._api_key:
+            return web.json_response(
+                _openai_error(
+                    "Browser takeover issuance requires a configured API key.",
+                    err_type="gateway_auth_error",
+                    code="browser_takeover_auth_required",
+                ),
+                status=403,
+            )
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response(
+                _openai_error("Request body must be valid JSON."), status=400
+            )
+        if not isinstance(payload, dict):
+            return web.json_response(
+                _openai_error("Request body must be a JSON object."), status=400
+            )
+
+        lease_id = str(payload.get("lease_id") or "").strip()
+        session_id = str(payload.get("session_id") or "").strip()
+        browser_profile_id = str(payload.get("browser_profile_id") or "").strip()
+        browser_session_id = str(payload.get("browser_session_id") or "").strip()
+        ttl_seconds = payload.get("ttl_seconds", 300)
+        if (
+            not lease_id
+            or not session_id
+            or not browser_profile_id
+            or not browser_session_id
+            or not isinstance(ttl_seconds, (int, float))
+            or isinstance(ttl_seconds, bool)
+            or not 0 < ttl_seconds <= 900
+        ):
+            return web.json_response(
+                _openai_error(
+                    "lease_id, session_id, browser_profile_id, browser_session_id, and a valid ttl_seconds are required.",
+                    code="browser_takeover_invalid_issue_request",
+                ),
+                status=400,
+            )
+
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(
+                _openai_error(
+                    "Session database unavailable.", code="session_db_unavailable"
+                ),
+                status=503,
+            )
+        session = await asyncio.to_thread(db.get_session, session_id)
+        if not session:
+            return web.json_response(
+                _openai_error(
+                    "Browser takeover may be issued only for an existing server session.",
+                    err_type="gateway_auth_error",
+                    code="browser_takeover_session_forbidden",
+                ),
+                status=403,
+            )
+
+        from gateway.browser_takeover import TakeoverScope
+        from gateway.browser_takeover_access import (
+            TAKEOVER_RESPONSE_HEADERS,
+            TakeoverAccessError,
+        )
+
+        profile = _api_request_profile.get() or "default"
+        scope = TakeoverScope(
+            principal_id=self._derive_browser_control_principal(profile),
+            profile_id=profile,
+            hermes_session_id=session_id,
+            browser_profile_id=browser_profile_id,
+            browser_session_id=browser_session_id,
+            transport_family=self._browser_control_transport_family(request),
+        )
+        try:
+            link = self._browser_takeover_api.access.issue(
+                lease_id, scope, ttl_seconds=float(ttl_seconds)
+            )
+        except (TakeoverAccessError, ValueError):
+            return web.json_response(
+                _openai_error(
+                    "The requested browser takeover is not active for this exact scope.",
+                    err_type="gateway_auth_error",
+                    code="browser_takeover_scope_forbidden",
+                ),
+                status=403,
+                headers=TAKEOVER_RESPONSE_HEADERS,
+            )
+        return web.json_response(
+            {
+                "lease_id": link.lease_id,
+                "url": link.url,
+                "expires_at": link.expires_at,
+                "scope": {
+                    "principal_id": scope.principal_id,
+                    "profile_id": scope.profile_id,
+                    "session_id": scope.hermes_session_id,
+                    "browser_profile_id": scope.browser_profile_id,
+                    "browser_session_id": scope.browser_session_id,
+                    "transport_family": scope.transport_family,
+                },
+            },
+            status=201,
+            headers=TAKEOVER_RESPONSE_HEADERS,
+        )
 
     async def _handle_browser_control_register(self, request: "web.Request") -> "web.Response":
         """POST /v1/browser-control/register — mint a controller ticket.

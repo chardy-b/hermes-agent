@@ -28,7 +28,8 @@ def _session(scope=SCOPE, *, healthy=True):
         display_id=":91",
         cdp_endpoint="http://127.0.0.1:19222",
         vnc_endpoint="vnc://127.0.0.1:15900",
-        novnc_endpoint="http://127.0.0.1:16080/vnc.html",
+        novnc_endpoint="http://127.0.0.1:6083/vnc.html",
+        novnc_websocket_endpoint="ws://127.0.0.1:6083/websockify",
         observe=lambda: BrowserObservation(
             state="still_blocked",
             active_tab_id="tab-local",

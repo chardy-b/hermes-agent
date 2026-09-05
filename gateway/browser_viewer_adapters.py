@@ -38,6 +38,7 @@ class DedicatedBrowserViewerSession:
     cdp_endpoint: str
     vnc_endpoint: str
     novnc_endpoint: str
+    novnc_websocket_endpoint: str
     observe: Callable[[], BrowserObservation]
     revoke: Callable[[], None]
     healthy: Callable[[], bool]
@@ -91,11 +92,15 @@ class LoopbackNoVNCViewerAdapter(BrowserViewerAdapter):
             return ViewerBinding(
                 adapter_id=self.adapter_id,
                 viewer_session_id=session.viewer_session_id,
+                browser_profile_id=session.scope.browser_profile_id,
+                browser_session_id=session.scope.browser_session_id,
+                transport_family=session.scope.transport_family,
                 display_id=session.display_id,
                 dedicated_display=True,
                 cdp_endpoint=session.cdp_endpoint,
                 vnc_endpoint=session.vnc_endpoint,
                 novnc_endpoint=session.novnc_endpoint,
+                novnc_websocket_endpoint=session.novnc_websocket_endpoint,
                 initial_observation=observation,
             )
 

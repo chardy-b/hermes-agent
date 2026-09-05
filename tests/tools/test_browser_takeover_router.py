@@ -21,11 +21,15 @@ class RouterAdapter(BrowserViewerAdapter):
         return ViewerBinding(
             adapter_id=self.adapter_id,
             viewer_session_id="viewer-router",
+            browser_profile_id=scope.browser_profile_id,
+            browser_session_id=scope.browser_session_id,
+            transport_family=scope.transport_family,
             display_id=":92",
             dedicated_display=True,
             cdp_endpoint="http://127.0.0.1:9223",
             vnc_endpoint="vnc://127.0.0.1:5902",
             novnc_endpoint="http://127.0.0.1:6082/vnc.html",
+            novnc_websocket_endpoint="ws://127.0.0.1:6082/websockify",
             initial_observation=BrowserObservation(
                 state="still_blocked",
                 active_tab_id="tab-router",
