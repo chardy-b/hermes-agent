@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tools import browser_camofox
 from tools.browser_camofox import (
     _auth_headers,
     camofox_back,
@@ -38,6 +39,15 @@ class TestAuthHeaders:
         monkeypatch.delenv("CAMOFOX_API_KEY", raising=False)
         assert _auth_headers() == {}
 
+    def test_non_secret_url_prefers_profile_config(self, monkeypatch):
+        monkeypatch.setenv("CAMOFOX_URL", "https://legacy.example")
+        monkeypatch.setattr(
+            browser_camofox,
+            "load_config",
+            lambda: {"browser": {"camofox": {"url": "http://127.0.0.1:9377/"}}},
+        )
+
+        assert get_camofox_url() == "http://127.0.0.1:9377"
 
     def test_empty_when_key_blank(self, monkeypatch):
         monkeypatch.setenv("CAMOFOX_API_KEY", "   ")
@@ -48,7 +58,9 @@ class TestAuthHeaders:
 
         monkeypatch.setenv("CAMOFOX_API_KEY", "default-profile-key")
         secret_scope.set_multiplex_active(True)
-        token = secret_scope.set_secret_scope({"CAMOFOX_API_KEY": "secondary-profile-key"})
+        token = secret_scope.set_secret_scope({
+            "CAMOFOX_API_KEY": "secondary-profile-key"
+        })
         try:
             assert _auth_headers() == {"Authorization": "Bearer secondary-profile-key"}
         finally:
@@ -73,17 +85,13 @@ class TestAuthHeaders:
         monkeypatch.setenv("CAMOFOX_URL", "https://default.example")
         monkeypatch.setenv("CAMOFOX_API_KEY", "default-profile-key")
         secret_scope.set_multiplex_active(True)
-        token = secret_scope.set_secret_scope(
-            {
-                "CAMOFOX_URL": "https://secondary.example/",
-                "CAMOFOX_API_KEY": "secondary-profile-key",
-            }
-        )
+        token = secret_scope.set_secret_scope({
+            "CAMOFOX_URL": "https://secondary.example/",
+            "CAMOFOX_API_KEY": "secondary-profile-key",
+        })
         try:
             assert get_camofox_url() == "https://secondary.example"
-            assert _auth_headers() == {
-                "Authorization": "Bearer secondary-profile-key"
-            }
+            assert _auth_headers() == {"Authorization": "Bearer secondary-profile-key"}
         finally:
             secret_scope.reset_secret_scope(token)
             secret_scope.set_multiplex_active(False)
@@ -103,7 +111,6 @@ class TestAuthHeadersSent:
         camofox_navigate("https://example.com", task_id="auth_test_1")
         _, kwargs = mock_post.call_args
         assert kwargs["headers"] == {"Authorization": "Bearer my-api-key"}
-
 
     @patch("tools.browser_camofox.requests.post")
     @patch("tools.browser_camofox.requests.delete")

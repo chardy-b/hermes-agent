@@ -90,7 +90,10 @@ def _auth_headers() -> Dict[str, str]:
 
 
 def get_camofox_url() -> str:
-    """Return the configured Camofox server URL, or empty string."""
+    """Return the profile-scoped non-secret endpoint, with legacy env fallback."""
+    configured = str(_get_camofox_config().get("url") or "").strip()
+    if configured:
+        return configured.rstrip("/")
     return (get_secret("CAMOFOX_URL", "") or "").rstrip("/")
 
 
