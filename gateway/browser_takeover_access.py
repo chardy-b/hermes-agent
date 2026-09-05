@@ -9,17 +9,19 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import math
 import secrets
 import threading
 import time
-import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 from urllib.parse import quote, urlsplit
 
 from gateway.browser_takeover import (
     BrowserTakeoverCoordinator,
     BrowserTakeoverError,
+    TakeoverCompletionReport,
+    TakeoverExpired,
     TakeoverScope,
     ViewerProxyTarget,
 )
@@ -50,6 +52,10 @@ class TakeoverScopeRejected(TakeoverAccessError):
 
 class TakeoverAccessCapacityExceeded(TakeoverAccessError):
     """The bounded credential store has no expired or revoked slot."""
+
+
+class TakeoverCompletionFailed(TakeoverAccessError):
+    """Ownership did not return safely after edge credentials were revoked."""
 
 
 @dataclass(frozen=True, repr=False)
@@ -99,6 +105,11 @@ class _AccessRecord:
     cookie_digest: Optional[bytes] = None
     consumed: bool = False
     revoked: bool = False
+    completing: bool = False
+    completion_cookie_digest: Optional[bytes] = None
+    completion_report: Optional[TakeoverCompletionReport] = None
+    completion_failed: bool = False
+    completion_event: threading.Event = field(default_factory=threading.Event)
 
 
 class TakeoverAccessManager:
@@ -111,6 +122,7 @@ class TakeoverAccessManager:
         base_url: str,
         clock: Optional[Callable[[], float]] = None,
         max_records: int = 128,
+        completion_wait_timeout: float = 10.0,
     ) -> None:
         parsed = urlsplit(str(base_url).strip())
         if (
@@ -134,6 +146,9 @@ class TakeoverAccessManager:
         ):
             raise ValueError("max_records must be a positive integer")
         self._max_records = max_records
+        if completion_wait_timeout <= 0:
+            raise ValueError("completion_wait_timeout must be positive")
+        self._completion_wait_timeout = float(completion_wait_timeout)
         self._lock = threading.RLock()
         self._records: dict[str, _AccessRecord] = {}
 
@@ -253,6 +268,100 @@ class TakeoverAccessManager:
             record.claim_digest = b""
             record.cookie_digest = None
 
+    def complete(
+        self,
+        lease_id: str,
+        cookie_value: str,
+        *,
+        origin: str,
+        scope: TakeoverScope,
+    ) -> TakeoverCompletionReport:
+        """Revoke edge credentials before returning browser ownership."""
+        self._check_origin(origin)
+        supplied = self._digest(cookie_value)
+        wait_event: Optional[threading.Event] = None
+
+        with self._lock:
+            record = self._record(lease_id)
+            self._check_scope(record, scope)
+            terminal = self._terminal_completion_locked(record, supplied)
+            if terminal is not None:
+                return terminal
+            expired_report = self._expired_completion_locked(record, supplied)
+            if expired_report is not None:
+                return expired_report
+            if record.completing:
+                wait_event = record.completion_event
+            elif (
+                record.revoked
+                or not record.consumed
+                or record.cookie_digest is None
+                or not hmac.compare_digest(record.cookie_digest, supplied)
+            ):
+                raise TakeoverClaimInvalid("takeover cookie is not valid")
+
+        if wait_event is not None:
+            return self._wait_for_completion(record, supplied, wait_event)
+
+        target = self._target(lease_id, scope)
+        with self._lock:
+            record = self._record(lease_id)
+            self._check_scope(record, scope)
+            terminal = self._terminal_completion_locked(record, supplied)
+            if terminal is not None:
+                return terminal
+            expired_report = self._expired_completion_locked(record, supplied)
+            if expired_report is not None:
+                return expired_report
+            if record.completing:
+                wait_event = record.completion_event
+            elif (
+                record.revoked
+                or record.cookie_digest is None
+                or not hmac.compare_digest(record.cookie_digest, supplied)
+                or not hmac.compare_digest(
+                    record.target_digest, self._target_digest(target)
+                )
+            ):
+                raise TakeoverClaimInvalid("takeover cookie is not valid")
+            else:
+                record.completing = True
+                record.revoked = True
+                record.claim_digest = b""
+                record.completion_cookie_digest = record.cookie_digest
+                record.cookie_digest = None
+                record.completion_event.clear()
+
+        if wait_event is not None:
+            return self._wait_for_completion(record, supplied, wait_event)
+
+        try:
+            report = self._coordinator.complete(lease_id, scope)
+        except TakeoverExpired:
+            try:
+                report = self._coordinator.completion_report(lease_id, scope)
+            except BrowserTakeoverError as exc:
+                self._record_completion_failure(record)
+                raise TakeoverCompletionFailed(
+                    "takeover completion did not return browser ownership"
+                ) from exc
+        except BrowserTakeoverError as exc:
+            self._record_completion_failure(record)
+            raise TakeoverCompletionFailed(
+                "takeover completion did not return browser ownership"
+            ) from exc
+        except Exception as exc:
+            self._record_completion_failure(record)
+            raise TakeoverCompletionFailed(
+                "takeover completion did not return browser ownership"
+            ) from exc
+
+        with self._lock:
+            record.completion_report = report
+            record.completing = False
+            record.completion_event.set()
+        return report
+
     def inspect(self, lease_id: str) -> AccessRecordInspection:
         with self._lock:
             record = self._record(lease_id)
@@ -275,13 +384,20 @@ class TakeoverAccessManager:
         with self._lock:
             return len(self._records)
 
-    def scope_for_profile(self, lease_id: str, profile_id: str) -> TakeoverScope:
+    def scope_for_profile(
+        self, lease_id: str, profile_id: str, *, allow_terminal: bool = False
+    ) -> TakeoverScope:
         """Resolve a public route only inside the lease profile prefix."""
         with self._lock:
             record = self._record(lease_id)
-            if record.revoked or record.scope.profile_id != profile_id:
+            if record.scope.profile_id != profile_id or (
+                record.revoked and not allow_terminal
+            ):
                 raise TakeoverClaimInvalid("takeover claim is not valid")
             return record.scope
+
+    def cookie_path(self, lease_id: str, scope: TakeoverScope) -> str:
+        return self._lease_path(scope, lease_id)
 
     def remaining_seconds(self, lease_id: str, scope: TakeoverScope) -> int:
         """Return the browser-cookie lifetime without extending server authority."""
@@ -291,6 +407,75 @@ class TakeoverAccessManager:
             if record.revoked:
                 raise TakeoverClaimInvalid("takeover claim is not valid")
             return max(0, math.ceil(record.expires_at - self._clock()))
+
+    @staticmethod
+    def _terminal_completion_locked(
+        record: _AccessRecord, supplied: bytes
+    ) -> Optional[TakeoverCompletionReport]:
+        if not (
+            record.completing
+            or record.completion_report is not None
+            or record.completion_failed
+        ):
+            return None
+        expected = record.completion_cookie_digest
+        if expected is None or not hmac.compare_digest(expected, supplied):
+            raise TakeoverClaimInvalid("takeover cookie is not valid")
+        if record.completion_failed:
+            raise TakeoverCompletionFailed(
+                "takeover completion did not return browser ownership"
+            )
+        return record.completion_report
+
+    def _wait_for_completion(
+        self,
+        record: _AccessRecord,
+        supplied: bytes,
+        event: threading.Event,
+    ) -> TakeoverCompletionReport:
+        if not event.wait(self._completion_wait_timeout):
+            raise TakeoverCompletionFailed("takeover completion is still in progress")
+        with self._lock:
+            report = self._terminal_completion_locked(record, supplied)
+            if report is None:
+                raise TakeoverCompletionFailed(
+                    "takeover completion did not return browser ownership"
+                )
+            return report
+
+    def _expired_completion_locked(
+        self,
+        record: _AccessRecord,
+        supplied: bytes,
+    ) -> Optional[TakeoverCompletionReport]:
+        if self._clock() < record.expires_at:
+            return None
+        if (
+            record.revoked
+            or not record.consumed
+            or record.cookie_digest is None
+            or not hmac.compare_digest(record.cookie_digest, supplied)
+        ):
+            raise TakeoverClaimInvalid("takeover cookie is not valid")
+        record.completion_cookie_digest = record.cookie_digest
+        record.cookie_digest = None
+        record.claim_digest = b""
+        record.revoked = True
+        report = TakeoverCompletionReport(
+            lease_id=record.lease_id,
+            outcome="expired",
+            continuity_verified=False,
+            active_tab_id="",
+        )
+        record.completion_report = report
+        record.completion_event.set()
+        return report
+
+    def _record_completion_failure(self, record: _AccessRecord) -> None:
+        with self._lock:
+            record.completing = False
+            record.completion_failed = True
+            record.completion_event.set()
 
     def _target(self, lease_id: str, scope: TakeoverScope) -> ViewerProxyTarget:
         try:
@@ -308,7 +493,7 @@ class TakeoverAccessManager:
         if len(self._records) < self._max_records:
             return
         for lease_id, record in tuple(self._records.items()):
-            if record.revoked or now >= record.expires_at:
+            if not record.completing and (record.revoked or now >= record.expires_at):
                 self._records.pop(lease_id, None)
                 if len(self._records) < self._max_records:
                     return

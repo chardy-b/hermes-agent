@@ -2,6 +2,7 @@
 
 import asyncio
 from types import SimpleNamespace
+from urllib.parse import urlsplit
 
 from aiohttp import WSMsgType, web
 from aiohttp.test_utils import TestClient, TestServer
@@ -207,6 +208,135 @@ async def _viewer_proxy_scenario():
     assert calls[1] == ("ws", "ws://127.0.0.1:6083/websockify")
 
 
+def test_human_done_route_returns_only_observed_state_and_revokes_access():
+    asyncio.run(_human_done_scenario())
+
+
+async def _human_done_scenario():
+    manager, grant, token = _edge()
+    api = BrowserTakeoverAPI(manager)
+    base = f"/p/profile-edge/v1/browser-takeover/{grant.lease_id}"
+    async with TestClient(TestServer(_app(api))) as client:
+        claimed = await client.post(
+            f"{base}/claim",
+            json={"claim": token},
+            headers={"Origin": "https://takeover.example"},
+        )
+        cookie = claimed.headers["Set-Cookie"].split(";", 1)[0]
+        control = await client.get(
+            f"{base}/control",
+            headers={"Sec-Fetch-Site": "same-origin", "Cookie": cookie},
+        )
+        control_body = await control.text()
+        wrong_origin = await client.post(
+            f"{base}/complete",
+            headers={"Origin": "https://evil.example", "Cookie": cookie},
+        )
+        wrong_profile = await client.post(
+            f"{base.replace('profile-edge', 'other')}/complete",
+            headers={
+                "Origin": "https://takeover.example",
+                "Cookie": cookie,
+            },
+        )
+        done = await client.post(
+            f"{base}/complete",
+            headers={
+                "Origin": "https://takeover.example",
+                "Cookie": cookie,
+            },
+        )
+        done_body = await done.json()
+        stale_viewer = await client.get(
+            f"{base}/viewer/vnc.html",
+            headers={"Sec-Fetch-Site": "same-origin", "Cookie": cookie},
+        )
+        duplicate = await client.post(
+            f"{base}/complete",
+            headers={
+                "Origin": "https://takeover.example",
+                "Cookie": cookie,
+            },
+        )
+        duplicate_body = await duplicate.json()
+        forged = await client.post(
+            f"{base}/complete",
+            headers={
+                "Origin": "https://takeover.example",
+                "Cookie": f"{TAKEOVER_COOKIE_NAME}=forged",
+            },
+        )
+
+    assert control.status == 200
+    assert 'id="takeover-done"' in control_body
+    assert 'id="takeover-viewer"' in control_body
+    assert token not in control_body
+    assert wrong_origin.status == 403
+    assert wrong_profile.status == 403
+    assert done.status == 200
+    assert done_body == {
+        "lease_id": grant.lease_id,
+        "outcome": "still_blocked",
+        "continuity_verified": True,
+        "active_tab_id": "tab-edge",
+    }
+    assert "Max-Age=0" in done.headers["Set-Cookie"]
+    assert stale_viewer.status == 403
+    assert duplicate.status == 200
+    assert duplicate_body == done_body
+    assert forged.status == 403
+
+
+def test_expired_done_reports_expired_without_releasing_agent_input():
+    asyncio.run(_expired_done_scenario())
+
+
+async def _expired_done_scenario():
+    clock = [100.0]
+    coordinator = BrowserTakeoverCoordinator(clock=lambda: 100.0)
+    grant = coordinator.acquire(SCOPE, EdgeAdapter(), ttl_seconds=300)
+    manager = TakeoverAccessManager(
+        coordinator,
+        base_url="https://takeover.example",
+        clock=lambda: clock[0],
+    )
+    token = urlsplit(
+        manager.issue(grant.lease_id, SCOPE, ttl_seconds=10).url
+    ).fragment.removeprefix("claim=")
+    async with TestClient(TestServer(_app(BrowserTakeoverAPI(manager)))) as client:
+        claim = await client.post(
+            f"/p/{SCOPE.profile_id}/v1/browser-takeover/{grant.lease_id}/claim",
+            json={"claim": token},
+            headers={"Origin": "https://takeover.example"},
+        )
+        cookie = claim.headers["Set-Cookie"].split(";", 1)[0]
+        clock[0] = 111.0
+        done = await client.post(
+            f"/p/{SCOPE.profile_id}/v1/browser-takeover/{grant.lease_id}/complete",
+            headers={"Origin": "https://takeover.example", "Cookie": cookie},
+        )
+        payload = await done.json()
+
+    assert done.status == 200
+    assert payload == {
+        "lease_id": grant.lease_id,
+        "outcome": "expired",
+        "continuity_verified": False,
+        "active_tab_id": "",
+    }
+    assert (
+        coordinator.guard_browser_action(
+            principal_id=SCOPE.principal_id,
+            profile_id=SCOPE.profile_id,
+            hermes_session_id=SCOPE.hermes_session_id,
+            browser_profile_id=SCOPE.browser_profile_id,
+            browser_session_id=SCOPE.browser_session_id,
+            transport_family=SCOPE.transport_family,
+        )
+        is not None
+    )
+
+
 def test_api_server_registers_takeover_routes_only_when_explicitly_enabled():
     disabled = APIServerAdapter(PlatformConfig(enabled=True))
     enabled = APIServerAdapter(
@@ -226,6 +356,8 @@ def test_api_server_registers_takeover_routes_only_when_explicitly_enabled():
     assert "/v1/browser-takeover/{lease_id}" not in disabled_paths
     assert "/v1/browser-takeover/issue" in enabled_paths
     assert "/v1/browser-takeover/{lease_id}" in enabled_paths
+    assert "/v1/browser-takeover/{lease_id}/control" in enabled_paths
+    assert "/v1/browser-takeover/{lease_id}/complete" in enabled_paths
     assert "/v1/browser-takeover/{lease_id}/viewer/{asset:.*}" in enabled_paths
     assert "/v1/browser-takeover/{lease_id}/ws" in enabled_paths
     assert enabled._browser_takeover_api is not None

@@ -140,13 +140,12 @@ def test_partial_scope_cannot_complete_or_release_agent_input():
         )
 
     assert adapter.revoked == []
-    assert (
-        coordinator.guard_browser_action(
-            hermes_session_id=SCOPE.hermes_session_id,
-            browser_session_id=SCOPE.browser_session_id,
-        )["error"]["code"]
-        == "human_control_active"
+    blocked = coordinator.guard_browser_action(
+        hermes_session_id=SCOPE.hermes_session_id,
+        browser_session_id=SCOPE.browser_session_id,
     )
+    assert blocked is not None
+    assert blocked["error"]["code"] == "human_control_active"
 
 
 def test_cross_profile_guard_blocks_without_disclosing_lease_metadata():
@@ -190,6 +189,29 @@ def test_completion_revokes_before_observation_and_preserves_continuity():
         )
         is None
     )
+
+
+@pytest.mark.parametrize("state", ["success", "browser_lost", "revoked"])
+def test_completion_reports_only_the_adapter_observed_state(state):
+    class StateAdapter(RecordingAdapter):
+        def observe(self, binding):
+            super().observe(binding)
+            if state == "browser_lost":
+                return BrowserObservation(state=state)
+            return BrowserObservation(
+                state=state,
+                active_tab_id="tab-a",
+                storage_fingerprint="storage-a",
+            )
+
+    coordinator = BrowserTakeoverCoordinator()
+    adapter = StateAdapter()
+    grant = coordinator.acquire(SCOPE, adapter, ttl_seconds=60)
+
+    report = coordinator.complete(grant.lease_id, SCOPE)
+
+    assert report.outcome == state
+    assert report.active_tab_id == ("" if state == "browser_lost" else "tab-a")
 
 
 def test_acquire_rejects_shared_display_or_non_loopback_listener():
@@ -241,6 +263,7 @@ def test_expiry_revokes_before_browser_actions_resume():
     assert adapter.revoked == ["viewer-a"]
     with pytest.raises(TakeoverExpired):
         coordinator.complete(grant.lease_id, SCOPE)
+    assert coordinator.completion_report(grant.lease_id, SCOPE).outcome == "expired"
 
 
 def test_concurrent_completion_revokes_only_once_and_is_idempotent():

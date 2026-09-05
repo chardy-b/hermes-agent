@@ -429,6 +429,20 @@ class BrowserTakeoverCoordinator:
             self._prune_terminal_locked()
         return report
 
+    def completion_report(
+        self, lease_id: str, scope: TakeoverScope
+    ) -> TakeoverCompletionReport:
+        """Return a terminal content-free report for one exact lease."""
+        with self._lock:
+            record = self._leases.get(lease_id)
+            if record is None:
+                raise TakeoverNotFound("takeover lease not found")
+            if record.grant.scope != scope:
+                raise TakeoverScopeMismatch("takeover scope does not exactly match")
+            if record.report is None:
+                raise TakeoverConflict("takeover has no terminal report")
+            return record.report
+
     def expire_due(
         self,
         *,

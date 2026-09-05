@@ -13,6 +13,7 @@ from gateway.browser_takeover_access import (
     TAKEOVER_RESPONSE_HEADERS,
     TakeoverAccessError,
     TakeoverAccessManager,
+    TakeoverCompletionFailed,
     TakeoverOriginRejected,
 )
 
@@ -30,9 +31,37 @@ _HANDOFF_HTML = """<!doctype html>
 <title>Hermes browser takeover</title><script defer src="/v1/browser-takeover/client.js"></script></head>
 <body><main><h1>Browser takeover</h1><p id="status">Claiming this browser session…</p></main></body></html>"""
 
+_CONTROL_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>Hermes browser takeover</title><script defer src="/v1/browser-takeover/client.js"></script></head>
+<body><main><h1>Browser takeover</h1><p id="status">Human control is active.</p>
+<iframe id="takeover-viewer" title="Browser viewer"></iframe>
+<button id="takeover-done" type="button">Done</button></main></body></html>"""
+
 _CLIENT_JS = """'use strict';
 (async () => {
   const status = document.getElementById('status');
+  if (location.pathname.endsWith('/control')) {
+    const base = location.pathname.slice(0, -'/control'.length);
+    const viewer = document.getElementById('takeover-viewer');
+    const done = document.getElementById('takeover-done');
+    const path = base.slice(1) + '/ws';
+    viewer.src = base + '/viewer/vnc.html?autoconnect=1&path=' + encodeURIComponent(path);
+    done.addEventListener('click', async () => {
+      done.disabled = true;
+      const response = await fetch(base + '/complete', {
+        method: 'POST', credentials: 'same-origin'
+      });
+      if (!response.ok) {
+        status.textContent = 'Browser ownership could not be returned safely.';
+        return;
+      }
+      const report = await response.json();
+      viewer.removeAttribute('src');
+      status.textContent = 'Observed browser state: ' + String(report.outcome);
+    });
+    return;
+  }
   const claim = new URLSearchParams(location.hash.slice(1)).get('claim');
   history.replaceState(null, '', location.pathname);
   if (!claim) { status.textContent = 'This takeover link is not valid.'; return; }
@@ -42,8 +71,7 @@ _CLIENT_JS = """'use strict';
   });
   status.textContent = response.ok ? 'Human control is active.' : 'This takeover link is not valid.';
   if (response.ok) {
-    const path = location.pathname.slice(1) + '/ws';
-    location.replace(location.pathname + '/viewer/vnc.html?autoconnect=1&path=' + encodeURIComponent(path));
+    location.replace(location.pathname + '/control');
   }
 })();
 """
@@ -69,6 +97,8 @@ class BrowserTakeoverAPI:
             ("GET", "/v1/browser-takeover/client.js", self.client_js),
             ("GET", root, self.page),
             ("POST", f"{root}/claim", self.claim),
+            ("GET", f"{root}/control", self.control),
+            ("POST", f"{root}/complete", self.complete),
             ("GET", f"{root}/viewer/{{asset:.*}}", self.viewer_asset),
             ("GET", f"{root}/ws", self.websocket),
         ]
@@ -140,11 +170,62 @@ class BrowserTakeoverAPI:
         if status != 200 or len(body) > _MAX_PROXY_BODY:
             return self._error(502)
         return web.Response(
+            status=status,
             body=body,
-            status=200,
             content_type=content_type.split(";", 1)[0],
             headers=self._headers(),
         )
+
+    async def control(self, request: web.Request) -> web.Response:
+        try:
+            self._authorize(request, allow_same_origin_navigation=True)
+        except TakeoverAccessError:
+            return self._error(403)
+        return web.Response(
+            text=_CONTROL_HTML,
+            content_type="text/html",
+            headers=self._headers(),
+        )
+
+    async def complete(self, request: web.Request) -> web.Response:
+        try:
+            scope = self._scope(request, allow_terminal=True)
+            origin = request.headers.get("Origin", "")
+            if origin != self.access.origin:
+                raise TakeoverOriginRejected("takeover origin is not allowed")
+            report = await asyncio.to_thread(
+                self.access.complete,
+                request.match_info["lease_id"],
+                request.cookies.get(TAKEOVER_COOKIE_NAME, ""),
+                origin=origin,
+                scope=scope,
+            )
+        except TakeoverOriginRejected:
+            return self._error(403)
+        except TakeoverCompletionFailed:
+            return self._error(409)
+        except TakeoverAccessError:
+            return self._error(403)
+        response = web.json_response(
+            {
+                "lease_id": report.lease_id,
+                "outcome": report.outcome,
+                "continuity_verified": report.continuity_verified,
+                "active_tab_id": report.active_tab_id,
+            },
+            headers=self._headers(),
+        )
+        response.set_cookie(
+            TAKEOVER_COOKIE_NAME,
+            "",
+            path=self.access.cookie_path(report.lease_id, scope),
+            secure=True,
+            httponly=True,
+            samesite="Strict",
+            max_age=0,
+            expires="Thu, 01 Jan 1970 00:00:00 GMT",
+        )
+        return response
 
     async def websocket(self, request: web.Request) -> web.StreamResponse:
         try:
@@ -156,9 +237,13 @@ class BrowserTakeoverAPI:
         except Exception:
             return self._error(502)
 
-    def _scope(self, request: web.Request):
+    def _scope(self, request: web.Request, *, allow_terminal: bool = False):
         profile = request.match_info.get("profile") or "default"
-        return self.access.scope_for_profile(request.match_info["lease_id"], profile)
+        return self.access.scope_for_profile(
+            request.match_info["lease_id"],
+            profile,
+            allow_terminal=allow_terminal,
+        )
 
     def _authorize(
         self, request: web.Request, *, allow_same_origin_navigation: bool = False
