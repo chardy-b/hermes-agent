@@ -560,3 +560,105 @@ async def _authenticated_issue_scenario(monkeypatch):
         "browser_session_id": scope.browser_session_id,
         "transport_family": scope.transport_family,
     }
+
+
+def test_authenticated_issue_route_acquires_configured_camofox_through_coordinator(
+    monkeypatch,
+):
+    asyncio.run(_authenticated_camofox_acquire_scenario(monkeypatch))
+
+
+async def _authenticated_camofox_acquire_scenario(monkeypatch):
+    from tools import browser_camofox
+
+    key = "fixture-neutral-api-key-123"
+    coordinator = BrowserTakeoverCoordinator()
+    monkeypatch.setattr(
+        "gateway.browser_takeover.get_browser_takeover_coordinator",
+        lambda: coordinator,
+    )
+    adapter = APIServerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "key": key,
+                "browser_takeover": {
+                    "enabled": True,
+                    "public_origin": "https://takeover.example",
+                    "adapter": "camofox-vnc",
+                },
+            },
+        )
+    )
+    session_id = "session-camofox"
+    cache_key = browser_camofox._session_cache_key(session_id, "default")
+    with browser_camofox._sessions_lock:
+        browser_camofox._sessions[cache_key] = {
+            "user_id": "managed-profile-user",
+            "tab_id": "managed-tab",
+            "session_key": "task-managed",
+            "managed": True,
+            "adopt_existing_tab": False,
+        }
+    browser_camofox._vnc_url = "http://localhost:6087"
+    browser_camofox._vnc_url_checked = True
+    monkeypatch.setattr(browser_camofox, "check_camofox_available", lambda: True)
+    adapter._session_db = SimpleNamespace(
+        get_session=lambda requested: (
+            {"id": requested} if requested == session_id else None
+        )
+    )
+
+    async def ensure_db():
+        return adapter._session_db
+
+    monkeypatch.setattr(adapter, "_ensure_session_db_async", ensure_db)
+    app = web.Application()
+    app.router.add_post(
+        "/v1/browser-takeover/issue", adapter._handle_browser_takeover_issue
+    )
+    try:
+        async with TestClient(TestServer(app)) as client:
+            issued = await client.post(
+                "/v1/browser-takeover/issue",
+                json={
+                    "session_id": session_id,
+                    "ttl_seconds": 30,
+                    "browser_profile_id": "attacker-supplied",
+                    "browser_session_id": "attacker-supplied",
+                },
+                headers={"Authorization": f"Bearer {key}"},
+            )
+            body = await issued.json()
+
+        assert issued.status == 201
+        assert body["adapter_id"] == "camofox-vnc"
+        assert body["scope"]["session_id"] == session_id
+        assert body["scope"]["browser_session_id"] == session_id
+        assert body["scope"]["browser_profile_id"] != "attacker-supplied"
+        scope = TakeoverScope(
+            principal_id=body["scope"]["principal_id"],
+            profile_id=body["scope"]["profile_id"],
+            hermes_session_id=body["scope"]["session_id"],
+            browser_profile_id=body["scope"]["browser_profile_id"],
+            browser_session_id=body["scope"]["browser_session_id"],
+            transport_family=body["scope"]["transport_family"],
+        )
+        blocked = coordinator.guard_browser_action(
+            principal_id=scope.principal_id,
+            profile_id=scope.profile_id,
+            hermes_session_id=scope.hermes_session_id,
+            browser_profile_id=scope.browser_profile_id,
+            browser_session_id=scope.browser_session_id,
+            transport_family=scope.transport_family,
+        )
+        assert blocked is not None
+        assert blocked["ownership"] == "human"
+        target = coordinator.viewer_proxy_target(body["lease_id"], scope)
+        assert target.adapter_id == "camofox-vnc"
+        assert "6087" not in str(body)
+        assert "managed-tab" not in str(body)
+    finally:
+        coordinator.reset()
+        with browser_camofox._sessions_lock:
+            browser_camofox._sessions.pop(cache_key, None)

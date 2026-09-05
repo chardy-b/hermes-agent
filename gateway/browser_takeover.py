@@ -103,8 +103,8 @@ class ViewerBinding:
     transport_family: str
     display_id: str
     dedicated_display: bool
-    cdp_endpoint: str
-    vnc_endpoint: str
+    cdp_endpoint: Optional[str]
+    vnc_endpoint: Optional[str]
     novnc_endpoint: str
     novnc_websocket_endpoint: str
     initial_observation: BrowserObservation
@@ -645,6 +645,10 @@ class BrowserTakeoverCoordinator:
                 {"ws", "wss"},
             ),
         ):
+            if endpoint is None:
+                if label in {"CDP", "VNC"}:
+                    continue
+                raise TakeoverSecurityError(f"{label} listener address is missing")
             parsed = urlsplit(endpoint)
             if (
                 parsed.scheme not in schemes

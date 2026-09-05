@@ -1554,6 +1554,7 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         self._companion_api = None
         self._browser_takeover_api = None
+        self._browser_takeover_service = None
         if AIOHTTP_AVAILABLE:
             # Companion support is an edge HTTP capability, not a model tool.
             # Keep its crypto/storage implementation out of this already-large
@@ -1566,11 +1567,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 from gateway.browser_takeover import get_browser_takeover_coordinator
                 from gateway.browser_takeover_access import TakeoverAccessManager
                 from gateway.browser_takeover_api import BrowserTakeoverAPI
+                from gateway.browser_takeover_service import BrowserTakeoverService
 
                 public_origin = str(takeover_config.get("public_origin") or "").strip()
                 try:
+                    takeover_coordinator = get_browser_takeover_coordinator()
                     access = TakeoverAccessManager(
-                        get_browser_takeover_coordinator(),
+                        takeover_coordinator,
                         base_url=public_origin,
                     )
                 except ValueError:
@@ -1580,6 +1583,19 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 else:
                     self._browser_takeover_api = BrowserTakeoverAPI(access)
+                    adapter_id = str(takeover_config.get("adapter") or "").strip()
+                    if adapter_id:
+                        try:
+                            self._browser_takeover_service = BrowserTakeoverService(
+                                takeover_coordinator,
+                                access,
+                                adapter_id=adapter_id,
+                            )
+                        except ValueError:
+                            logger.error(
+                                "[%s] browser takeover acquisition disabled: unsupported adapter",
+                                self.name,
+                            )
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
@@ -3624,18 +3640,20 @@ class APIServerAdapter(BasePlatformAdapter):
         browser_profile_id = str(payload.get("browser_profile_id") or "").strip()
         browser_session_id = str(payload.get("browser_session_id") or "").strip()
         ttl_seconds = payload.get("ttl_seconds", 300)
+        acquire_new = self._browser_takeover_service is not None and not lease_id
         if (
-            not lease_id
-            or not session_id
-            or not browser_profile_id
-            or not browser_session_id
+            not session_id
             or not isinstance(ttl_seconds, (int, float))
             or isinstance(ttl_seconds, bool)
             or not 0 < ttl_seconds <= 900
+            or (
+                not acquire_new
+                and (not lease_id or not browser_profile_id or not browser_session_id)
+            )
         ):
             return web.json_response(
                 _openai_error(
-                    "lease_id, session_id, browser_profile_id, browser_session_id, and a valid ttl_seconds are required.",
+                    "An existing lease with exact browser scope, or a configured adapter session, and a valid ttl_seconds are required.",
                     code="browser_takeover_invalid_issue_request",
                 ),
                 status=400,
@@ -3660,40 +3678,67 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=403,
             )
 
-        from gateway.browser_takeover import TakeoverScope
+        from gateway.browser_takeover import BrowserTakeoverError, TakeoverScope
         from gateway.browser_takeover_access import (
             TAKEOVER_RESPONSE_HEADERS,
             TakeoverAccessError,
         )
 
         profile = _api_request_profile.get() or "default"
-        scope = TakeoverScope(
-            principal_id=self._derive_browser_control_principal(profile),
-            profile_id=profile,
-            hermes_session_id=session_id,
-            browser_profile_id=browser_profile_id,
-            browser_session_id=browser_session_id,
-            transport_family=self._browser_control_transport_family(request),
-        )
-        try:
-            link = self._browser_takeover_api.access.issue(
-                lease_id, scope, ttl_seconds=float(ttl_seconds)
+        principal_id = self._derive_browser_control_principal(profile)
+        transport_family = self._browser_control_transport_family(request)
+        adapter_id = ""
+        if acquire_new:
+            try:
+                issued = await asyncio.to_thread(
+                    self._browser_takeover_service.issue_for_session,
+                    principal_id=principal_id,
+                    profile_id=profile,
+                    hermes_session_id=session_id,
+                    transport_family=transport_family,
+                    ttl_seconds=float(ttl_seconds),
+                )
+            except (BrowserTakeoverError, TakeoverAccessError, ValueError):
+                return web.json_response(
+                    _openai_error(
+                        "The exact takeover-capable browser session is unavailable.",
+                        code="browser_takeover_session_unavailable",
+                    ),
+                    status=409,
+                    headers=TAKEOVER_RESPONSE_HEADERS,
+                )
+            scope = issued.grant.scope
+            link = issued.link
+            adapter_id = issued.grant.adapter_id
+        else:
+            scope = TakeoverScope(
+                principal_id=principal_id,
+                profile_id=profile,
+                hermes_session_id=session_id,
+                browser_profile_id=browser_profile_id,
+                browser_session_id=browser_session_id,
+                transport_family=transport_family,
             )
-        except (TakeoverAccessError, ValueError):
-            return web.json_response(
-                _openai_error(
-                    "The requested browser takeover is not active for this exact scope.",
-                    err_type="gateway_auth_error",
-                    code="browser_takeover_scope_forbidden",
-                ),
-                status=403,
-                headers=TAKEOVER_RESPONSE_HEADERS,
-            )
+            try:
+                link = self._browser_takeover_api.access.issue(
+                    lease_id, scope, ttl_seconds=float(ttl_seconds)
+                )
+            except (TakeoverAccessError, ValueError):
+                return web.json_response(
+                    _openai_error(
+                        "The requested browser takeover is not active for this exact scope.",
+                        err_type="gateway_auth_error",
+                        code="browser_takeover_scope_forbidden",
+                    ),
+                    status=403,
+                    headers=TAKEOVER_RESPONSE_HEADERS,
+                )
         return web.json_response(
             {
                 "lease_id": link.lease_id,
                 "url": link.url,
                 "expires_at": link.expires_at,
+                "adapter_id": adapter_id,
                 "scope": {
                     "principal_id": scope.principal_id,
                     "profile_id": scope.profile_id,

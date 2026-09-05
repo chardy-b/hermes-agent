@@ -79,6 +79,52 @@ class TestEphemeralMode:
         s2 = _get_session("task-1")
         assert s1 is s2
 
+    def test_default_task_uses_one_normalized_cache_and_provider_scope(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+
+        implicit = _get_session(None)
+        explicit = _get_session("default")
+
+        assert implicit is explicit
+        assert implicit["session_key"] == "task_default"
+
+    def test_unmanaged_provider_scope_uses_the_normalized_task_prefix(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+
+        session = _get_session("abcdefghijklmnop-more")
+
+        assert session["session_key"] == "task_abcdefghijklmnop"
+
+    def test_same_task_id_is_isolated_between_profiles(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+        profile = ["profile-a"]
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: profile[0]
+        )
+
+        first = _get_session("shared-task")
+        profile[0] = "profile-b"
+        second = _get_session("shared-task")
+        profile[0] = "profile-a"
+
+        assert first is not second
+        assert first["user_id"] != second["user_id"]
+        assert _get_session("shared-task") is first
+        import tools.browser_camofox as mod
+
+        with mod._sessions_lock:
+            assert set(mod._sessions) == {
+                ("profile-a", "shared-task"),
+                ("profile-b", "shared-task"),
+            }
+
 
 class TestManagedPersistenceMode:
     """With managed_persistence: stable userId derived from Hermes profile."""
@@ -94,6 +140,18 @@ class TestManagedPersistenceMode:
             assert session["session_key"] == expected["session_key"]
             assert session["managed"] is True
 
+    def test_default_and_explicit_default_tasks_share_managed_identity(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+
+        with _enable_persistence():
+            implicit = _get_session(None)
+            explicit = _get_session("default")
+
+        assert implicit is explicit
+        assert implicit["session_key"] == get_camofox_identity("default")["session_key"]
 
     def test_navigate_reuses_identity_after_close(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -243,6 +301,18 @@ class TestConfiguredCamofoxIdentity:
             timeout=5,
         )
 
+    def test_external_identity_without_session_key_uses_normalized_task_scope(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+        monkeypatch.setenv("CAMOFOX_USER_ID", "shared-camofox")
+
+        session = _get_session(None)
+
+        assert session["user_id"] == "shared-camofox"
+        assert session["session_key"] == "task_default"
+        assert session["managed"] is True
 
     def test_soft_cleanup_preserves_externally_managed_session(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -255,8 +325,9 @@ class TestConfiguredCamofoxIdentity:
 
         assert result is True
         import tools.browser_camofox as mod
+
         with mod._sessions_lock:
-            assert "task-1" not in mod._sessions
+            assert mod._session_cache_key("task-1") not in mod._sessions
 
 
 class TestVncUrlDiscovery:
@@ -270,7 +341,9 @@ class TestVncUrlDiscovery:
         assert get_vnc_url() == "http://myhost:6080"
 
 
-    def test_navigate_includes_vnc_hint(self, tmp_path, monkeypatch):
+    def test_navigate_does_not_expose_health_discovered_vnc_route(
+        self, tmp_path, monkeypatch
+    ):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
         import tools.browser_camofox as mod
@@ -282,8 +355,10 @@ class TestVncUrlDiscovery:
         )):
             result = json.loads(camofox_navigate("https://example.com", task_id="vnc-test"))
 
-        assert result["vnc_url"] == "http://localhost:6080"
-        assert "vnc_hint" in result
+        assert result["success"] is True
+        assert "vnc_url" not in result
+        assert "vnc_hint" not in result
+        assert "6080" not in json.dumps(result)
 
 
 class TestCamofoxSoftCleanup:
@@ -300,9 +375,9 @@ class TestCamofoxSoftCleanup:
         assert result is True
         # Session should have been dropped from in-memory store
         import tools.browser_camofox as mod
-        with mod._sessions_lock:
-            assert "task-1" not in mod._sessions
 
+        with mod._sessions_lock:
+            assert mod._session_cache_key("task-1") not in mod._sessions
 
     def test_does_not_call_server_delete(self, tmp_path, monkeypatch):
         """Soft cleanup must never hit the Camofox /sessions DELETE endpoint."""
