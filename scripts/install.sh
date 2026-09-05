@@ -198,7 +198,7 @@ while [[ $# -gt 0 ]]; do
             echo "  small and ensures the command is on PATH for all shells."
             echo "  Existing installs at \$HERMES_HOME/hermes-agent are preserved in-place."
             echo "  --ensure DEPS  Install only specified deps (comma-separated)"
-            echo "                   Supported: node, browser, ripgrep, ffmpeg"
+            echo "                   Supported: node, browser, browser-takeover, ripgrep, ffmpeg"
             echo "                   Does NOT clone repo or create venv"
 
             exit 0
@@ -3216,7 +3216,7 @@ ensure_browser() {
     # Time-boxed (#39219): a stalled npm registry fetch here would otherwise
     # hang the installer with no progress, same class as the desktop build.
     if ! run_with_timeout "$NODE_DEPS_TIMEOUT" "$npm_bin" install -g --prefix "$HERMES_HOME/node" --silent --ignore-scripts \
-        "@askjo/camofox-browser@^1.5.2" \
+        "@askjo/camofox-browser@1.5.2" \
         >"$log_file" 2>&1; then
         log_error "npm install failed or timed out:"
         cat "$log_file" >&2
@@ -3237,6 +3237,29 @@ ensure_browser() {
     return 0
 }
 
+validate_browser_takeover_install() {
+    local package_json="$HERMES_HOME/node/lib/node_modules/@askjo/camofox-browser/package.json"
+    local installed_version=""
+    if ! command -v node >/dev/null 2>&1 || ! node --version >/dev/null 2>&1; then
+        log_error "Browser takeover validation failed: Node.js is unavailable"
+        return 1
+    fi
+    if ! command -v npm >/dev/null 2>&1 || ! npm --version >/dev/null 2>&1; then
+        log_error "Browser takeover validation failed: npm is unavailable"
+        return 1
+    fi
+    if [ ! -f "$package_json" ]; then
+        log_error "Camofox package manifest is missing after installation."
+        return 1
+    fi
+    installed_version="$(node -e 'const fs=require("fs"); const p=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); process.stdout.write(String(p.version||""));' "$package_json")" || return 1
+    if [ "$installed_version" != "1.5.2" ]; then
+        log_error "Camofox package version does not match the approved takeover dependency."
+        return 1
+    fi
+    log_info "Browser takeover provider installed; run hermes doctor against the configured service to validate browser/display and VNC/noVNC health"
+}
+
 ensure_mode() {
     detect_os
 
@@ -3252,6 +3275,16 @@ ensure_mode() {
                 if [ "$HAS_NODE" = true ]; then
                     ensure_browser
                 fi
+                ;;
+            browser-takeover)
+                log_info "Provisioning opt-in browser takeover dependencies..."
+                check_node
+                if [ "$HAS_NODE" != true ]; then
+                    log_error "Browser takeover requires Node.js; dependency provisioning failed"
+                    return 1
+                fi
+                ensure_browser || return $?
+                validate_browser_takeover_install || return $?
                 ;;
             ripgrep)
                 if ! command -v rg &>/dev/null; then

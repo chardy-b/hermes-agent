@@ -2765,6 +2765,23 @@ def run_doctor(args):
         for note in _termux_install_all_fallback_notes():
             check_info(note)
 
+    _section("Browser Takeover")
+    try:
+        from hermes_cli.browser_takeover_doctor import collect_browser_takeover_readiness
+
+        takeover_rows = collect_browser_takeover_readiness()
+        if not takeover_rows:
+            check_ok("Browser takeover", "(disabled; opt-in only)")
+        for row in takeover_rows:
+            if row.ok:
+                check_ok(row.label, f"({row.detail})")
+            else:
+                check_warn(row.label, f"({row.detail})")
+                manual_issues.append(f"Repair {row.label}: {row.detail}")
+    except Exception as exc:
+        check_warn("Browser takeover readiness", f"({type(exc).__name__})")
+        manual_issues.append("Repair browser takeover configuration and rerun hermes doctor")
+
     _section("API Connectivity")
     # Refactor: every connectivity probe below is HTTP-bound and fully
     # independent. Running them in series spent ~5s wall on a typical

@@ -3,6 +3,7 @@
 import json
 from unittest.mock import MagicMock, patch
 
+import pytest
 
 from tools.browser_camofox import (
     camofox_back,
@@ -360,5 +361,33 @@ class TestBrowserToolRouting:
         monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
         from tools.browser_tool import check_browser_requirements
         assert check_browser_requirements() is True
+
+
+@pytest.mark.parametrize(
+    "invoke",
+    [
+        lambda: camofox_navigate("https://example.com", task_id="takeover-task"),
+        lambda: camofox_snapshot(task_id="takeover-task"),
+        lambda: camofox_click("@e1", task_id="takeover-task"),
+        lambda: camofox_type("@e1", "value", task_id="takeover-task"),
+        lambda: camofox_scroll("down", task_id="takeover-task"),
+        lambda: camofox_back(task_id="takeover-task"),
+        lambda: camofox_press("Enter", task_id="takeover-task"),
+        lambda: camofox_close(task_id="takeover-task"),
+        lambda: camofox_get_images(task_id="takeover-task"),
+        lambda: camofox_vision("question", task_id="takeover-task"),
+        lambda: camofox_console(task_id="takeover-task"),
+    ],
+)
+def test_every_camofox_action_honors_takeover_ownership(monkeypatch, invoke):
+    blocked = json.dumps({
+        "ok": False,
+        "error": {"code": "human_control_active"},
+    })
+    monkeypatch.setattr(
+        "tools.browser_camofox._guard_camofox_takeover", lambda _task_id: blocked
+    )
+
+    assert invoke() == blocked
 
 

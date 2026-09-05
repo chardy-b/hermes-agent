@@ -66,9 +66,9 @@ def extension_controller_available(action: str) -> bool:
             return False
         session_id = get_session_env("HERMES_SESSION_ID", "") or None
         principal_id = get_session_env("HERMES_BROWSER_CONTROL_PRINCIPAL", "") or None
-        transport_family = get_session_env(
-            "HERMES_BROWSER_CONTROL_TRANSPORT_FAMILY", ""
-        ) or None
+        transport_family = (
+            get_session_env("HERMES_BROWSER_CONTROL_TRANSPORT_FAMILY", "") or None
+        )
         if not session_id or not principal_id or not transport_family:
             return False
         broker = get_browser_control_broker()
@@ -172,9 +172,7 @@ def route_browser_tool(
     if controller is None:
         from gateway.browser_control_broker import ControllerUnavailable
 
-        raise ControllerUnavailable(
-            f"bound browser controller cannot execute {action}"
-        )
+        raise ControllerUnavailable(f"bound browser controller cannot execute {action}")
 
     # A controller was selected: it is authoritative. Never retry through the
     # existing backend, whatever happens here. Registry handlers must return a
@@ -213,17 +211,74 @@ def routed_browser_handler(
     task_id: Optional[str] = None,
     session_id: Optional[str] = None,
     principal_id: Optional[str] = None,
+    browser_profile_id: Optional[str] = None,
     transport_family: Optional[str] = None,
     tool_call_id: Optional[str] = None,
 ) -> Any:
-    """Lazy registry-handler route wrapper for ``browser_*`` tools.
+    """Route one browser handler without permitting concurrent human input.
 
-    Resolves the feature flag and process-local broker lazily so the
-    default (feature off) path costs one cached config read and an immediate
-    fallback, and so importing ``tools.browser_tool`` never imports the
-    gateway. When the gateway cannot be imported or the feature is off, the
-    legacy handler runs unchanged.
+    Human takeover is checked before the extension-control feature flag. A
+    lease owns the physical browser regardless of which agent-side backend
+    would otherwise receive the action. With no active lease this preserves
+    the historical lazy extension-or-legacy path byte for byte.
     """
+    profile_id: Optional[str] = None
+    try:
+        from gateway.session_context import get_session_env
+
+        session_id = session_id or get_session_env("HERMES_SESSION_ID", "") or None
+        profile_id = get_session_env("HERMES_SESSION_PROFILE", "") or "default"
+        principal_id = (
+            principal_id
+            or get_session_env("HERMES_BROWSER_CONTROL_PRINCIPAL", "")
+            or None
+        )
+        transport_family = (
+            transport_family
+            or get_session_env("HERMES_BROWSER_CONTROL_TRANSPORT_FAMILY", "")
+            or None
+        )
+    except Exception:
+        pass
+
+    try:
+        from gateway.browser_takeover import get_browser_takeover_coordinator
+    except ImportError:
+        logger.error("browser takeover module unavailable; input remains disabled")
+        return json.dumps({
+            "ok": False,
+            "error": {
+                "code": "takeover_state_unavailable",
+                "message": (
+                    "Browser ownership could not be verified; input remains disabled."
+                ),
+            },
+        })
+    else:
+        try:
+            blocked = get_browser_takeover_coordinator().guard_browser_action(
+                principal_id=principal_id,
+                profile_id=profile_id,
+                hermes_session_id=session_id or "",
+                browser_profile_id=browser_profile_id,
+                browser_session_id=task_id or session_id,
+                transport_family=transport_family,
+            )
+        except Exception:
+            logger.error("browser takeover ownership check failed")
+            return json.dumps({
+                "ok": False,
+                "error": {
+                    "code": "takeover_state_unavailable",
+                    "message": (
+                        "Browser ownership could not be verified; "
+                        "input remains disabled."
+                    ),
+                },
+            })
+        if blocked is not None:
+            return json.dumps(blocked, ensure_ascii=False)
+
     try:
         from gateway.browser_control_broker import (
             browser_control_enabled,
@@ -241,19 +296,6 @@ def routed_browser_handler(
 
     if tool_call_id is None:
         tool_call_id = current_tool_call_id()
-
-    try:
-        from gateway.session_context import get_session_env
-
-        session_id = session_id or get_session_env("HERMES_SESSION_ID", "") or None
-        principal_id = principal_id or get_session_env(
-            "HERMES_BROWSER_CONTROL_PRINCIPAL", ""
-        ) or None
-        transport_family = transport_family or get_session_env(
-            "HERMES_BROWSER_CONTROL_TRANSPORT_FAMILY", ""
-        ) or None
-    except Exception:
-        pass
 
     return route_browser_tool(
         action,

@@ -84,6 +84,7 @@ def test_browser_install_timeout_stays_interruptible() -> None:
 # host Playwright already supports.
 # ---------------------------------------------------------------------------
 
+import shlex
 import subprocess
 
 
@@ -218,7 +219,7 @@ def test_ensure_browser_no_longer_npm_installs_agent_browser() -> None:
     assert "agent-browser@" not in body
     assert "Installing Chromium via agent-browser install" not in body
     # camofox is unrelated to this change and must still be installed here.
-    assert "@askjo/camofox-browser@^1.5.2" in body
+    assert "@askjo/camofox-browser@1.5.2" in body
     # System-browser detection is still cheap/valuable without agent-browser.
     assert "find_system_browser" in body
     assert "configure_browser_env_from_system_browser" in body
@@ -244,6 +245,113 @@ def test_ensure_browser_no_longer_references_agent_browser_binary_path() -> None
     assert "$HERMES_HOME/node/bin/agent-browser" not in body
 
 
+def test_browser_takeover_ensure_uses_hardened_camofox_install_path() -> None:
+    body = _extract_function_body(INSTALL_SH.read_text(), "ensure_mode")
+    assert "browser-takeover)" in body
+    assert "ensure_browser" in body
+    assert "validate_browser_takeover_install" in body
 
 
+def test_browser_takeover_ensure_dispatches_browser_installer() -> None:
+    body = _extract_function_body(INSTALL_SH.read_text(), "ensure_mode")
+    harness = f"""
+set -eu
+ENSURE_DEPS=browser-takeover
+HAS_NODE=false
+detect_os() {{ :; }}
+check_node() {{ HAS_NODE=true; }}
+log_info() {{ :; }}
+ensure_browser() {{ printf '%s\\n' browser-installer-called; }}
+validate_browser_takeover_install() {{ printf '%s\\n' browser-validator-called; }}
+{body}
+ensure_mode
+"""
+    result = subprocess.run(
+        ["bash", "-c", harness],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "browser-installer-called",
+        "browser-validator-called",
+    ]
+
+
+def test_browser_takeover_ensure_fails_when_node_provisioning_fails() -> None:
+    body = _extract_function_body(INSTALL_SH.read_text(), "ensure_mode")
+    harness = f"""
+set -u
+ENSURE_DEPS=browser-takeover
+HAS_NODE=true
+detect_os() {{ :; }}
+check_node() {{ HAS_NODE=false; }}
+log_info() {{ :; }}
+log_error() {{ printf '%s\\n' "$*" >&2; }}
+ensure_browser() {{ exit 91; }}
+validate_browser_takeover_install() {{ exit 92; }}
+{body}
+ensure_mode
+"""
+    result = subprocess.run(
+        ["bash", "-c", harness], capture_output=True, text=True, check=False
+    )
+
+    assert result.returncode != 0
+    assert "dependency provisioning failed" in result.stderr
+
+
+def test_browser_takeover_ensure_propagates_browser_installer_failure() -> None:
+    body = _extract_function_body(INSTALL_SH.read_text(), "ensure_mode")
+    harness = f"""
+set -u
+ENSURE_DEPS=browser-takeover
+HAS_NODE=false
+detect_os() {{ :; }}
+check_node() {{ HAS_NODE=true; }}
+log_info() {{ :; }}
+log_error() {{ :; }}
+ensure_browser() {{ return 91; }}
+validate_browser_takeover_install() {{ return 0; }}
+{body}
+ensure_mode
+"""
+    result = subprocess.run(
+        ["bash", "-c", harness], capture_output=True, text=True, check=False
+    )
+
+    assert result.returncode == 91
+
+
+def test_browser_takeover_validator_checks_global_npm_package(tmp_path) -> None:
+    package = (
+        tmp_path
+        / "node"
+        / "lib"
+        / "node_modules"
+        / "@askjo"
+        / "camofox-browser"
+        / "package.json"
+    )
+    package.parent.mkdir(parents=True)
+    package.write_text('{"version":"1.5.2"}', encoding="utf-8")
+    body = _extract_function_body(
+        INSTALL_SH.read_text(), "validate_browser_takeover_install"
+    )
+    harness = f"""
+set -eu
+HERMES_HOME={shlex.quote(str(tmp_path))}
+log_error() {{ printf '%s\\n' "$*" >&2; }}
+log_info() {{ printf '%s\\n' validated; }}
+node() {{ printf '1.5.2'; }}
+npm() {{ return 0; }}
+{body}
+validate_browser_takeover_install
+"""
+    result = subprocess.run(
+        ["bash", "-c", harness], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["validated"]

@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_TIMEOUT = 30  # fallback when config is unreadable
 _SNAPSHOT_MAX_CHARS = 80_000  # camofox paginates at this limit
 _vnc_url: Optional[str] = None  # cached from /health response
-_vnc_url_checked = False  # only probe once per process
+_vnc_url_checked: bool = False  # only probe once per process
 
 # Cached command timeout from config (resolved lazily, like browser_tool)
 _cached_cmd_timeout: Optional[int] = None
@@ -66,7 +66,7 @@ def _get_command_timeout() -> int:
     """
     global _cached_cmd_timeout, _cmd_timeout_resolved
     if _cmd_timeout_resolved:
-        return _cached_cmd_timeout  # type: ignore[return-value]
+        return _cached_cmd_timeout
 
     _cmd_timeout_resolved = True
     result = _DEFAULT_TIMEOUT
@@ -90,7 +90,10 @@ def _auth_headers() -> Dict[str, str]:
 
 
 def get_camofox_url() -> str:
-    """Return the configured Camofox server URL, or empty string."""
+    """Return the profile-scoped non-secret endpoint, with legacy env fallback."""
+    configured = str(_get_camofox_config().get("url") or "").strip()
+    if configured:
+        return configured.rstrip("/")
     return (get_secret("CAMOFOX_URL", "") or "").rstrip("/")
 
 
@@ -331,9 +334,62 @@ def _rewrite_loopback_url_for_camofox(url: str) -> tuple[str, Optional[Dict[str,
 # ---------------------------------------------------------------------------
 # Session management
 # ---------------------------------------------------------------------------
-# Maps task_id -> {"user_id": str, "tab_id": str|None}
-_sessions: Dict[str, Dict[str, Any]] = {}
+# Maps (profile_id, task_id) -> {"user_id": str, "tab_id": str|None}
+_sessions: Dict[tuple[str, str], Dict[str, Any]] = {}
 _sessions_lock = threading.Lock()
+
+
+def _session_cache_key(
+    task_id: Optional[str], profile_id: Optional[str] = None
+) -> tuple[str, str]:
+    """Namespace process-local browser sessions by exact Hermes profile."""
+    resolved_profile = (profile_id or "").strip()
+    if not resolved_profile:
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            resolved_profile = (get_active_profile_name() or "").strip()
+        except Exception:
+            resolved_profile = ""
+    if not resolved_profile:
+        from hermes_constants import get_hermes_home
+
+        resolved_profile = f"home:{get_hermes_home().resolve()}"
+    return resolved_profile, task_id or "default"
+
+
+def _guard_camofox_takeover(task_id: Optional[str]) -> Optional[str]:
+    """Fail closed before any Camofox action while its task has human ownership."""
+    profile_id, normalized_task_id = _session_cache_key(task_id)
+    try:
+        from gateway.browser_takeover import get_browser_takeover_coordinator
+        from gateway.session_context import get_session_env
+
+        blocked = get_browser_takeover_coordinator().guard_browser_action(
+            principal_id=(
+                get_session_env("HERMES_BROWSER_CONTROL_PRINCIPAL", "") or None
+            ),
+            profile_id=profile_id,
+            hermes_session_id=normalized_task_id,
+            browser_profile_id=None,
+            browser_session_id=normalized_task_id,
+            transport_family=(
+                get_session_env("HERMES_BROWSER_CONTROL_TRANSPORT_FAMILY", "")
+                or None
+            ),
+        )
+    except Exception:
+        logger.error("Camofox takeover ownership check failed")
+        blocked = {
+            "ok": False,
+            "error": {
+                "code": "takeover_state_unavailable",
+                "message": (
+                    "Browser ownership could not be verified; input remains disabled."
+                ),
+            },
+        }
+    return json.dumps(blocked, ensure_ascii=False) if blocked is not None else None
 
 
 def _adopt_existing_tab(session: Dict[str, Any]) -> Dict[str, Any]:
@@ -375,19 +431,20 @@ def _adopt_existing_tab(session: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
-    """Get or create a camofox session for the given task.
+    """Get or create a Camofox session for the active profile and task.
 
-    When managed persistence is enabled, uses a deterministic userId
-    derived from the Hermes profile so the Camofox server can map it
-    to the same persistent browser profile across restarts.
+    The cache key owns normalization for both dimensions. Reusing its normalized
+    task component for provider identities keeps ``None`` and ``"default"``
+    equivalent in unmanaged, managed, and externally configured modes.
     """
-    task_id = task_id or "default"
+    cache_key = _session_cache_key(task_id)
+    normalized_task_id = cache_key[1]
     with _sessions_lock:
-        if task_id in _sessions:
-            return _adopt_existing_tab(_sessions[task_id])
+        if cache_key in _sessions:
+            return _adopt_existing_tab(_sessions[cache_key])
 
         camofox_cfg = _get_camofox_config()
-        identity_override = _camofox_identity_override(task_id, camofox_cfg)
+        identity_override = _camofox_identity_override(normalized_task_id, camofox_cfg)
         if identity_override:
             session = {
                 "user_id": identity_override["user_id"],
@@ -397,7 +454,7 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
                 "adopt_existing_tab": _adopt_existing_tab_enabled(camofox_cfg),
             }
         elif bool(camofox_cfg.get("managed_persistence")):
-            identity = get_camofox_identity(task_id)
+            identity = get_camofox_identity(normalized_task_id)
             session = {
                 "user_id": identity["user_id"],
                 "tab_id": None,
@@ -409,12 +466,45 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
             session = {
                 "user_id": f"hermes_{uuid.uuid4().hex[:10]}",
                 "tab_id": None,
-                "session_key": f"task_{task_id[:16]}",
+                "session_key": f"task_{normalized_task_id[:16]}",
                 "managed": False,
                 "adopt_existing_tab": False,
             }
-        _sessions[task_id] = session
+        _sessions[cache_key] = session
         return _adopt_existing_tab(session)
+
+
+def get_camofox_takeover_identity(
+    task_id: Optional[str], *, profile_id: Optional[str] = None
+) -> Optional[tuple[str, str]]:
+    """Return the exact in-process Camofox user/tab identity, if active."""
+    key = _session_cache_key(task_id, profile_id)
+    with _sessions_lock:
+        session = _sessions.get(key)
+        if session is None:
+            return None
+        user_id = session.get("user_id")
+        tab_id = session.get("tab_id")
+        if not isinstance(user_id, str) or not user_id:
+            return None
+        if not isinstance(tab_id, str) or not tab_id:
+            return None
+        return user_id, tab_id
+
+
+def camofox_takeover_session_healthy(
+    task_id: Optional[str],
+    expected_identity: tuple[str, str],
+    *,
+    profile_id: Optional[str] = None,
+) -> bool:
+    """Check that takeover still points at the exact task-scoped Camofox tab."""
+    if (
+        get_camofox_takeover_identity(task_id, profile_id=profile_id)
+        != expected_identity
+    ):
+        return False
+    return check_camofox_available()
 
 
 def _ensure_tab(task_id: Optional[str], url: str = "about:blank") -> Dict[str, Any]:
@@ -441,9 +531,9 @@ def _ensure_tab(task_id: Optional[str], url: str = "about:blank") -> Dict[str, A
 
 def _drop_session(task_id: Optional[str]) -> Optional[Dict[str, Any]]:
     """Remove and return session info."""
-    task_id = task_id or "default"
+    session_key = _session_cache_key(task_id)
     with _sessions_lock:
-        return _sessions.pop(task_id, None)
+        return _sessions.pop(session_key, None)
 
 
 def camofox_soft_cleanup(task_id: Optional[str] = None) -> bool:
@@ -477,7 +567,7 @@ def _post(path: str, body: dict, timeout: Optional[int] = None) -> dict:
     return resp.json()
 
 
-def _get(path: str, params: dict = None, timeout: Optional[int] = None) -> dict:
+def _get(path: str, params: Optional[dict] = None, timeout: Optional[int] = None) -> dict:
     """GET from camofox and return parsed response."""
     if timeout is None:
         timeout = _get_command_timeout()
@@ -487,7 +577,7 @@ def _get(path: str, params: dict = None, timeout: Optional[int] = None) -> dict:
     return resp.json()
 
 
-def _get_raw(path: str, params: dict = None, timeout: Optional[int] = None) -> requests.Response:
+def _get_raw(path: str, params: Optional[dict] = None, timeout: Optional[int] = None) -> requests.Response:
     """GET from camofox and return raw response (for binary data)."""
     if timeout is None:
         timeout = _get_command_timeout()
@@ -497,7 +587,7 @@ def _get_raw(path: str, params: dict = None, timeout: Optional[int] = None) -> r
     return resp
 
 
-def _delete(path: str, body: dict = None, timeout: Optional[int] = None) -> dict:
+def _delete(path: str, body: Optional[dict] = None, timeout: Optional[int] = None) -> dict:
     """DELETE to camofox and return parsed response."""
     if timeout is None:
         timeout = _get_command_timeout()
@@ -513,6 +603,9 @@ def _delete(path: str, body: dict = None, timeout: Optional[int] = None) -> dict
 
 def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
     """Navigate to a URL via Camofox."""
+    takeover_block = _guard_camofox_takeover(task_id)
+    if takeover_block is not None:
+        return takeover_block
     try:
         browser_url, rewrite_info = _rewrite_loopback_url_for_camofox(url)
         session = _get_session(task_id)
@@ -552,13 +645,9 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
                 "Rewrote loopback URL for Docker-hosted Camofox: "
                 f"{rewrite_info['from']} -> {rewrite_info['to']}"
             )
-        vnc = get_vnc_url()
-        if vnc:
-            result["vnc_url"] = vnc
-            result["vnc_hint"] = (
-                "Browser is visible via VNC. "
-                "Share this link with the user so they can watch the browser live."
-            )
+        # The health-discovered VNC listener is an internal takeover transport.
+        # It is never returned by browser tools; authenticated handoff routes
+        # are issued by the shared BrowserTakeoverCoordinator edge.
 
         # Auto-take a compact snapshot so the model can act immediately
         try:
@@ -634,6 +723,9 @@ def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
     ``user_task`` is deprecated and ignored — oversized snapshots always
     truncate-and-store (no LLM summarization), same as the main browser tool.
     """
+    takeover_block = _guard_camofox_takeover(task_id)
+    if takeover_block is not None:
+        return takeover_block
     try:
         session = _get_session(task_id)
         if not session["tab_id"]:
@@ -674,6 +766,9 @@ def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
 
 def camofox_click(ref: str, task_id: Optional[str] = None) -> str:
     """Click an element by ref via Camofox."""
+    takeover_block = _guard_camofox_takeover(task_id)
+    if takeover_block is not None:
+        return takeover_block
     try:
         session = _get_session(task_id)
         if not session["tab_id"]:
@@ -701,6 +796,9 @@ def camofox_click(ref: str, task_id: Optional[str] = None) -> str:
 
 def camofox_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
     """Type text into an element by ref via Camofox."""
+    takeover_block = _guard_camofox_takeover(task_id)
+    if takeover_block is not None:
+        return takeover_block
     try:
         session = _get_session(task_id)
         if not session["tab_id"]:
@@ -742,6 +840,9 @@ def camofox_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
 
 def camofox_scroll(direction: str, task_id: Optional[str] = None) -> str:
     """Scroll the page via Camofox."""
+    takeover_block = _guard_camofox_takeover(task_id)
+    if takeover_block is not None:
+        return takeover_block
     try:
         session = _get_session(task_id)
         if not session["tab_id"]:
@@ -758,6 +859,9 @@ def camofox_scroll(direction: str, task_id: Optional[str] = None) -> str:
 
 def camofox_back(task_id: Optional[str] = None) -> str:
     """Navigate back via Camofox."""
+    takeover_block = _guard_camofox_takeover(task_id)
+    if takeover_block is not None:
+        return takeover_block
     try:
         session = _get_session(task_id)
         if not session["tab_id"]:
@@ -774,6 +878,9 @@ def camofox_back(task_id: Optional[str] = None) -> str:
 
 def camofox_press(key: str, task_id: Optional[str] = None) -> str:
     """Press a keyboard key via Camofox."""
+    takeover_block = _guard_camofox_takeover(task_id)
+    if takeover_block is not None:
+        return takeover_block
     try:
         session = _get_session(task_id)
         if not session["tab_id"]:
@@ -794,6 +901,9 @@ def camofox_press(key: str, task_id: Optional[str] = None) -> str:
 
 def camofox_close(task_id: Optional[str] = None) -> str:
     """Close the browser session via Camofox."""
+    takeover_block = _guard_camofox_takeover(task_id)
+    if takeover_block is not None:
+        return takeover_block
     try:
         session = _drop_session(task_id)
         if not session:
@@ -813,6 +923,9 @@ def camofox_get_images(task_id: Optional[str] = None) -> str:
     Extracts image information from the accessibility tree snapshot,
     since Camofox does not expose a dedicated /images endpoint.
     """
+    takeover_block = _guard_camofox_takeover(task_id)
+    if takeover_block is not None:
+        return takeover_block
     try:
         session = _get_session(task_id)
         if not session["tab_id"]:
@@ -861,6 +974,9 @@ def camofox_get_images(task_id: Optional[str] = None) -> str:
 def camofox_vision(question: str, annotate: bool = False,
                    task_id: Optional[str] = None) -> str:
     """Take a screenshot and analyze it with vision AI via Camofox."""
+    takeover_block = _guard_camofox_takeover(task_id)
+    if takeover_block is not None:
+        return takeover_block
     try:
         session = _get_session(task_id)
         if not session["tab_id"]:
@@ -961,6 +1077,9 @@ def camofox_console(clear: bool = False, task_id: Optional[str] = None) -> str:
     Camofox does not expose browser console logs via its REST API.
     Returns an empty result with a note.
     """
+    takeover_block = _guard_camofox_takeover(task_id)
+    if takeover_block is not None:
+        return takeover_block
     return json.dumps({
         "success": True,
         "console_messages": [],

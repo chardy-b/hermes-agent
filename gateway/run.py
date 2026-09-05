@@ -1001,6 +1001,64 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
 
 
+def _try_complete_browser_takeover_reply(text: str) -> Optional[str]:
+    """Consume exact completion/cancel replies for the authenticated session."""
+    action = str(text or "").strip().casefold()
+    if action not in {"done", "/done", "cancel", "/cancel"}:
+        return None
+    from gateway.browser_takeover import BrowserTakeoverError
+    from gateway.browser_takeover_access import TakeoverAccessError
+    from gateway.browser_takeover_service import get_browser_takeover_service
+
+    service = get_browser_takeover_service()
+    if service is None:
+        return None
+    try:
+        report = (
+            service.cancel_from_context()
+            if action in {"cancel", "/cancel"}
+            else service.complete_from_context()
+        )
+    except (BrowserTakeoverError, TakeoverAccessError, ValueError):
+        return (
+            "Browser control could not be returned safely. "
+            "Agent browser input remains blocked."
+        )
+    if report is None:
+        return None
+    if report.outcome == "canceled":
+        return "Browser takeover canceled. Viewer access was revoked before agent control returned."
+    if report.outcome == "browser_lost":
+        return (
+            "Browser control ended, but the browser session was lost. "
+            "The agent must establish a new verified session before continuing."
+        )
+    if not report.continuity_verified:
+        return (
+            "Browser control returned to the agent, but continuity was not verified. "
+            "The agent must re-check browser state before acting."
+        )
+    return (
+        "Browser control returned to the agent. "
+        "The agent will verify browser state before continuing."
+    )
+
+
+def _human_assist_response(
+    messages: List[Dict[str, Any]], *, history_offset: int
+) -> Optional[str]:
+    from gateway.browser_takeover_delivery import (
+        extract_human_assist_required,
+        render_human_assist_required,
+    )
+
+    payload = extract_human_assist_required(
+        messages,
+        history_offset=history_offset,
+    )
+    return render_human_assist_required(payload) if payload is not None else None
+
+
 def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     """Sanitize final gateway replies before sending them to chat surfaces.
 
@@ -21414,7 +21472,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
-        
+
+        # A plain Done reply is an authenticated control-plane acknowledgement,
+        # not model input, only when this exact session owns one active takeover.
+        if not getattr(event, "internal", False):
+            takeover_reply = await self._run_in_executor_with_context(
+                _try_complete_browser_takeover_reply,
+                event.text or "",
+            )
+            if takeover_reply is not None:
+                self._clear_session_env(_session_env_tokens)
+                return takeover_reply
+
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
         persist_user_message = None
@@ -23272,6 +23341,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "rephrase your question."
                 )
             agent_messages = agent_result.get("messages", [])
+            human_assist = _human_assist_response(
+                agent_messages,
+                history_offset=len(history),
+            )
+            if human_assist is not None:
+                response = human_assist
+                _intentional_silence = False
             _response_time = time.time() - _msg_start_time
             _api_calls = agent_result.get("api_calls", 0)
             _resp_len = len(response)
