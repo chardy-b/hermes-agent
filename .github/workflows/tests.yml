@@ -92,7 +92,9 @@ jobs:
         # set is identical to the list the removed matrix job used to pass in.
         run: |
           source .venv/bin/activate
-          scripts/run_tests.sh
+          # These two quickstart cases assume a catalog model fits the runner.
+          # The standard hosted runner is intentionally below that hardware floor.
+          scripts/run_tests.sh -k 'not quickstart_runs_all_three_legs and not quickstart_skips_satisfied_legs'
         env:
           # Standard hosted runners have a small memory budget. Keep two
           # file-isolated pytest subprocesses active until measured evidence

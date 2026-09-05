@@ -496,6 +496,7 @@ honcho-ai = false
 httplib2 = false
 httpx = false
 httpx2 = false
+jsonschema = false
 huggingface_hub = false
 jinja2 = false
 lark-oapi = false

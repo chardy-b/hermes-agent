@@ -43,6 +43,7 @@ pytest = false
 pillow = false
 setuptools-rust = false
 tenacity = false
+jsonschema = false
 pyjwt = false
 slack-bolt = false
 fal-client = false
@@ -1749,8 +1750,8 @@ daytona = [
 ]
 dev = [
     { name = "debugpy" },
-    { name = "jsonschema" },
     { name = "httpx2" },
+    { name = "jsonschema" },
     { name = "mcp" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
