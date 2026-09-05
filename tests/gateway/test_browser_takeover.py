@@ -243,6 +243,33 @@ def test_completion_reports_only_the_adapter_observed_state(state):
 
     assert report.outcome == state
     assert report.active_tab_id == ("" if state == "browser_lost" else "tab-a")
+    assert coordinator.lease_ownership(grant.lease_id, SCOPE) == (
+        "browser_lost" if state == "browser_lost" else "agent"
+    )
+
+
+def test_explicit_cancel_revokes_exact_lease_and_records_safe_event():
+    coordinator = BrowserTakeoverCoordinator(max_lifecycle_events=2)
+    adapter = RecordingAdapter()
+    grant = coordinator.acquire(SCOPE, adapter)
+
+    report = coordinator.cancel(grant.lease_id, SCOPE)
+
+    assert report.outcome == "canceled"
+    assert report.continuity_verified is False
+    assert adapter.revoked == ["viewer-a"]
+    assert coordinator.lease_ownership(grant.lease_id, SCOPE) == "canceled"
+    assert (
+        coordinator.guard_browser_action(
+            hermes_session_id=SCOPE.hermes_session_id,
+            browser_session_id=SCOPE.browser_session_id,
+        )
+        is None
+    )
+    assert coordinator.lifecycle_counts["acquired"] == 1
+    assert coordinator.lifecycle_counts["canceled"] == 1
+    assert len(coordinator.lifecycle_events) == 2
+    assert grant.lease_id not in repr(coordinator.lifecycle_events)
 
 
 def test_acquire_rejects_shared_display_or_non_loopback_listener():

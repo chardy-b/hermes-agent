@@ -109,6 +109,7 @@ class _AccessRecord:
     completion_cookie_digest: Optional[bytes] = None
     completion_report: Optional[TakeoverCompletionReport] = None
     completion_failed: bool = False
+    websocket_authorizations: int = 0
     completion_event: threading.Event = field(default_factory=threading.Event)
 
 
@@ -122,6 +123,7 @@ class TakeoverAccessManager:
         base_url: str,
         clock: Optional[Callable[[], float]] = None,
         max_records: int = 128,
+        max_websocket_connections: int = 8,
         completion_wait_timeout: float = 10.0,
     ) -> None:
         parsed = urlsplit(str(base_url).strip())
@@ -146,11 +148,19 @@ class TakeoverAccessManager:
         ):
             raise ValueError("max_records must be a positive integer")
         self._max_records = max_records
+        if (
+            not isinstance(max_websocket_connections, int)
+            or isinstance(max_websocket_connections, bool)
+            or max_websocket_connections < 1
+        ):
+            raise ValueError("max_websocket_connections must be a positive integer")
+        self._max_websocket_connections = max_websocket_connections
         if completion_wait_timeout <= 0:
             raise ValueError("completion_wait_timeout must be positive")
         self._completion_wait_timeout = float(completion_wait_timeout)
         self._lock = threading.RLock()
         self._records: dict[str, _AccessRecord] = {}
+        self._revocation_listeners: list[Callable[[str, TakeoverScope], None]] = []
 
     def __repr__(self) -> str:
         with self._lock:
@@ -260,13 +270,72 @@ class TakeoverAccessManager:
                 raise TakeoverClaimInvalid("takeover cookie is not valid")
         return target
 
-    def revoke(self, lease_id: str, scope: TakeoverScope) -> None:
+    def authorize_websocket(
+        self,
+        lease_id: str,
+        cookie_value: str,
+        *,
+        origin: str,
+        scope: TakeoverScope,
+    ) -> ViewerProxyTarget:
+        """Authorize one bounded initial WebSocket or reconnect."""
+        target = self.authorize(lease_id, cookie_value, origin=origin, scope=scope)
         with self._lock:
             record = self._record(lease_id)
             self._check_scope(record, scope)
+            if record.revoked or self._clock() >= record.expires_at:
+                raise TakeoverClaimInvalid("takeover cookie is not valid")
+            if record.websocket_authorizations >= self._max_websocket_connections:
+                raise TakeoverClaimInvalid("takeover cookie is not valid")
+            record.websocket_authorizations += 1
+        return target
+
+    def remaining_lifetime(self, lease_id: str, scope: TakeoverScope) -> float:
+        with self._lock:
+            record = self._record(lease_id)
+            self._check_scope(record, scope)
+            return max(0.0, record.expires_at - self._clock())
+
+    def register_revocation_listener(
+        self, listener: Callable[[str, TakeoverScope], None]
+    ) -> None:
+        with self._lock:
+            if listener not in self._revocation_listeners:
+                self._revocation_listeners.append(listener)
+
+    def _notify_revoked(self, lease_id: str, scope: TakeoverScope) -> None:
+        with self._lock:
+            listeners = tuple(self._revocation_listeners)
+        for listener in listeners:
+            try:
+                listener(lease_id, scope)
+            except Exception:
+                continue
+
+    def revoke(self, lease_id: str, scope: TakeoverScope) -> None:
+        notify = False
+        with self._lock:
+            record = self._record(lease_id)
+            self._check_scope(record, scope)
+            notify = not record.revoked
             record.revoked = True
             record.claim_digest = b""
             record.cookie_digest = None
+        if notify:
+            self._notify_revoked(lease_id, scope)
+
+    def invalidate_all(self) -> None:
+        """Invalidate every edge credential before process shutdown reset."""
+        revoked: list[tuple[str, TakeoverScope]] = []
+        with self._lock:
+            for record in self._records.values():
+                if not record.revoked:
+                    revoked.append((record.lease_id, record.scope))
+                record.revoked = True
+                record.claim_digest = b""
+                record.cookie_digest = None
+        for lease_id, scope in revoked:
+            self._notify_revoked(lease_id, scope)
 
     def complete(
         self,
@@ -335,6 +404,7 @@ class TakeoverAccessManager:
         if wait_event is not None:
             return self._wait_for_completion(record, supplied, wait_event)
 
+        self._notify_revoked(lease_id, scope)
         return self._complete_coordinator(record, lease_id, scope)
 
     def complete_scoped(
@@ -376,7 +446,40 @@ class TakeoverAccessManager:
 
         if wait_event is not None:
             return self._wait_for_scoped_completion(record, wait_event)
+        self._notify_revoked(lease_id, scope)
         return self._complete_coordinator(record, lease_id, scope)
+
+    def cancel_scoped(
+        self, lease_id: str, scope: TakeoverScope
+    ) -> TakeoverCompletionReport:
+        """Revoke edge credentials then cancel one trusted exact session."""
+        wait_event: Optional[threading.Event] = None
+        with self._lock:
+            record = self._record(lease_id)
+            self._check_scope(record, scope)
+            if record.completion_report is not None:
+                return record.completion_report
+            if record.completing:
+                wait_event = record.completion_event
+            else:
+                record.completing = True
+                record.revoked = True
+                record.claim_digest = b""
+                record.completion_cookie_digest = record.cookie_digest
+                record.cookie_digest = None
+                record.completion_event.clear()
+        if wait_event is not None:
+            return self._wait_for_scoped_completion(record, wait_event)
+        self._notify_revoked(lease_id, scope)
+        try:
+            report = self._coordinator.cancel(lease_id, scope)
+        except BrowserTakeoverError as exc:
+            self._record_completion_failure(record)
+            raise TakeoverCompletionFailed(
+                "takeover cancellation did not revoke browser ownership"
+            ) from exc
+        self._record_completion_success(record, report)
+        return report
 
     def _complete_coordinator(
         self,
@@ -405,10 +508,7 @@ class TakeoverAccessManager:
                 "takeover completion did not return browser ownership"
             ) from exc
 
-        with self._lock:
-            record.completion_report = report
-            record.completing = False
-            record.completion_event.set()
+        self._record_completion_success(record, report)
         return report
 
     def inspect(self, lease_id: str) -> AccessRecordInspection:
@@ -533,6 +633,14 @@ class TakeoverAccessManager:
         record.completion_report = report
         record.completion_event.set()
         return report
+
+    def _record_completion_success(
+        self, record: _AccessRecord, report: TakeoverCompletionReport
+    ) -> None:
+        with self._lock:
+            record.completion_report = report
+            record.completing = False
+            record.completion_event.set()
 
     def _record_completion_failure(self, record: _AccessRecord) -> None:
         with self._lock:

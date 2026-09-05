@@ -133,6 +133,32 @@ def test_claim_is_single_use_and_cookie_supports_reconnect():
     assert cookie.value not in repr(cookie)
 
 
+def test_websocket_reconnects_are_authenticated_and_bounded():
+    coordinator = BrowserTakeoverCoordinator()
+    grant = coordinator.acquire(SCOPE, Adapter(), ttl_seconds=60)
+    manager = TakeoverAccessManager(
+        coordinator, base_url="https://takeover.example", max_websocket_connections=2
+    )
+    link = manager.issue(grant.lease_id, SCOPE, ttl_seconds=60)
+    token = urlsplit(link.url).fragment.removeprefix("claim=")
+    cookie = manager.claim(
+        grant.lease_id, token, origin="https://takeover.example", scope=SCOPE
+    )
+    manager.authorize_websocket(
+        grant.lease_id, cookie.value, origin="https://takeover.example", scope=SCOPE
+    )
+    manager.authorize_websocket(
+        grant.lease_id, cookie.value, origin="https://takeover.example", scope=SCOPE
+    )
+    with pytest.raises(TakeoverClaimInvalid):
+        manager.authorize_websocket(
+            grant.lease_id,
+            cookie.value,
+            origin="https://takeover.example",
+            scope=SCOPE,
+        )
+
+
 def test_access_record_history_is_bounded_and_prunes_revoked_records():
     coordinator = BrowserTakeoverCoordinator()
     manager = TakeoverAccessManager(

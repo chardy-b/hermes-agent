@@ -266,6 +266,23 @@ class BrowserTakeoverService:
             transport_family=transport,
         )
 
+    def cancel_from_context(self) -> Optional[TakeoverCompletionReport]:
+        principal, profile, session, transport = _current_session_identity()
+        grant = self._coordinator.active_grant_for_session(
+            principal_id=principal,
+            profile_id=profile,
+            hermes_session_id=session,
+            transport_family=transport,
+        )
+        if grant is None:
+            return None
+        return self._access.cancel_scoped(grant.lease_id, grant.scope)
+
+    def shutdown(self) -> None:
+        """Invalidate public access before revoking all process-local viewers."""
+        self._access.invalidate_all()
+        self._coordinator.reset()
+
 
 def _current_session_identity() -> tuple[str, str, str, str]:
     from gateway.session_context import get_session_env

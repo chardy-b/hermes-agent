@@ -169,7 +169,8 @@ async def _viewer_proxy_scenario():
         calls.append(("http", target, asset))
         return 200, "text/html", b"viewer"
 
-    async def bridge(request, target):
+    async def bridge(request, target, revoked):
+        assert revoked.is_set() is False
         calls.append(("ws", target))
         return web.Response(status=204)
 
@@ -218,6 +219,132 @@ async def _viewer_proxy_scenario():
     assert calls[0][1].http_url == "http://127.0.0.1:6083/vnc.html"
     assert calls[0][2] == "vnc.html"
     assert calls[1] == ("ws", "ws://127.0.0.1:6083/websockify")
+
+
+def test_active_websocket_is_closed_when_exact_lease_is_revoked():
+    asyncio.run(_active_websocket_revocation_scenario())
+
+
+async def _active_websocket_revocation_scenario():
+    manager, grant, token = _edge()
+    started = asyncio.Event()
+
+    async def bridge(request, target, revoked):
+        started.set()
+        await asyncio.wait_for(revoked.wait(), timeout=1)
+        return web.Response(status=204)
+
+    api = BrowserTakeoverAPI(manager, websocket_bridge=bridge)
+    base = f"/p/profile-edge/v1/browser-takeover/{grant.lease_id}"
+    async with TestClient(TestServer(_app(api))) as client:
+        claimed = await client.post(
+            f"{base}/claim",
+            json={"claim": token},
+            headers={"Origin": "https://takeover.example"},
+        )
+        cookie = claimed.headers["Set-Cookie"].split(";", 1)[0]
+        request_task = asyncio.create_task(
+            client.get(
+                f"{base}/ws",
+                headers={
+                    "Origin": "https://takeover.example",
+                    "Cookie": cookie,
+                },
+            )
+        )
+        await asyncio.wait_for(started.wait(), timeout=1)
+        manager.revoke(grant.lease_id, SCOPE)
+        response = await asyncio.wait_for(request_task, timeout=1)
+
+    assert response.status == 204
+
+
+def test_rejected_parallel_socket_does_not_consume_reconnect_budget():
+    asyncio.run(_parallel_socket_budget_scenario())
+
+
+async def _parallel_socket_budget_scenario():
+    coordinator = BrowserTakeoverCoordinator()
+    grant = coordinator.acquire(SCOPE, EdgeAdapter(), ttl_seconds=60)
+    manager = TakeoverAccessManager(
+        coordinator,
+        base_url="https://takeover.example",
+        max_websocket_connections=2,
+    )
+    link = manager.issue(grant.lease_id, SCOPE, ttl_seconds=60)
+    token = link.url.split("#claim=", 1)[1]
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def bridge(request, target, revoked):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            started.set()
+            await asyncio.wait_for(release.wait(), timeout=1)
+        return web.Response(status=204)
+
+    api = BrowserTakeoverAPI(manager, websocket_bridge=bridge)
+    base = f"/p/profile-edge/v1/browser-takeover/{grant.lease_id}"
+    async with TestClient(TestServer(_app(api))) as client:
+        claimed = await client.post(
+            f"{base}/claim",
+            json={"claim": token},
+            headers={"Origin": "https://takeover.example"},
+        )
+        headers = {
+            "Origin": "https://takeover.example",
+            "Cookie": claimed.headers["Set-Cookie"].split(";", 1)[0],
+        }
+        first = asyncio.create_task(client.get(f"{base}/ws", headers=headers))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        parallel = await client.get(f"{base}/ws", headers=headers)
+        release.set()
+        first_response = await asyncio.wait_for(first, timeout=1)
+        reconnect = await client.get(f"{base}/ws", headers=headers)
+
+    assert parallel.status == 403
+    assert first_response.status == 204
+    assert reconnect.status == 204
+
+
+def test_active_websocket_closes_at_access_expiry():
+    asyncio.run(_active_websocket_expiry_scenario())
+
+
+async def _active_websocket_expiry_scenario():
+    coordinator = BrowserTakeoverCoordinator()
+    grant = coordinator.acquire(SCOPE, EdgeAdapter(), ttl_seconds=1)
+    manager = TakeoverAccessManager(coordinator, base_url="https://takeover.example")
+    link = manager.issue(grant.lease_id, SCOPE, ttl_seconds=0.05)
+    token = link.url.split("#claim=", 1)[1]
+    revoked_seen = asyncio.Event()
+
+    async def bridge(request, target, revoked):
+        await asyncio.wait_for(revoked.wait(), timeout=1)
+        revoked_seen.set()
+        return web.Response(status=204)
+
+    api = BrowserTakeoverAPI(manager, websocket_bridge=bridge)
+    base = f"/p/profile-edge/v1/browser-takeover/{grant.lease_id}"
+    async with TestClient(TestServer(_app(api))) as client:
+        claimed = await client.post(
+            f"{base}/claim",
+            json={"claim": token},
+            headers={"Origin": "https://takeover.example"},
+        )
+        cookie = claimed.headers["Set-Cookie"].split(";", 1)[0]
+        response = await client.get(
+            f"{base}/ws",
+            headers={
+                "Origin": "https://takeover.example",
+                "Cookie": cookie,
+            },
+        )
+
+    assert response.status == 204
+    assert revoked_seen.is_set()
 
 
 def test_human_done_route_returns_only_observed_state_and_revokes_access():

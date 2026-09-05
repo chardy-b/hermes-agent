@@ -1002,8 +1002,9 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
 
 
 def _try_complete_browser_takeover_reply(text: str) -> Optional[str]:
-    """Consume an exact Done reply only for the authenticated active session."""
-    if str(text or "").strip().casefold() not in {"done", "/done"}:
+    """Consume exact completion/cancel replies for the authenticated session."""
+    action = str(text or "").strip().casefold()
+    if action not in {"done", "/done", "cancel", "/cancel"}:
         return None
     from gateway.browser_takeover import BrowserTakeoverError
     from gateway.browser_takeover_access import TakeoverAccessError
@@ -1013,7 +1014,11 @@ def _try_complete_browser_takeover_reply(text: str) -> Optional[str]:
     if service is None:
         return None
     try:
-        report = service.complete_from_context()
+        report = (
+            service.cancel_from_context()
+            if action in {"cancel", "/cancel"}
+            else service.complete_from_context()
+        )
     except (BrowserTakeoverError, TakeoverAccessError, ValueError):
         return (
             "Browser control could not be returned safely. "
@@ -1021,6 +1026,8 @@ def _try_complete_browser_takeover_reply(text: str) -> Optional[str]:
         )
     if report is None:
         return None
+    if report.outcome == "canceled":
+        return "Browser takeover canceled. Viewer access was revoked before agent control returned."
     if report.outcome == "browser_lost":
         return (
             "Browser control ended, but the browser session was lost. "

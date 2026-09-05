@@ -7,10 +7,12 @@ VNC, or noVNC endpoints; ownership is the coordinator's single source of truth.
 from __future__ import annotations
 
 import ipaddress
+import logging
 import secrets
 import threading
 import time
 from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 from urllib.parse import urlsplit
@@ -31,7 +33,10 @@ _OBSERVATION_STATES = frozenset({
     "browser_lost",
     "expired",
     "revoked",
+    "canceled",
 })
+
+logger = logging.getLogger(__name__)
 
 
 class BrowserTakeoverError(RuntimeError):
@@ -153,6 +158,13 @@ class TakeoverCompletionReport:
     active_tab_id: str
 
 
+@dataclass(frozen=True)
+class TakeoverLifecycleEvent:
+    event: str
+    ownership: str
+    adapter_id: str
+
+
 @dataclass(frozen=True, repr=False)
 class ViewerProxyTarget:
     """Private exact noVNC upstream used only by the authenticated proxy."""
@@ -189,17 +201,49 @@ class BrowserTakeoverCoordinator:
         clock: Optional[Callable[[], float]] = None,
         completion_wait_timeout: float = 10.0,
         max_terminal_leases: int = 128,
+        max_lifecycle_events: int = 256,
     ) -> None:
         self._clock = clock if clock is not None else time.time
         if completion_wait_timeout <= 0:
             raise ValueError("completion_wait_timeout must be positive")
         if not isinstance(max_terminal_leases, int) or max_terminal_leases < 1:
             raise ValueError("max_terminal_leases must be a positive integer")
+        if not isinstance(max_lifecycle_events, int) or max_lifecycle_events < 1:
+            raise ValueError("max_lifecycle_events must be a positive integer")
         self._completion_wait_timeout = float(completion_wait_timeout)
         self._max_terminal_leases = max_terminal_leases
         self._lock = threading.RLock()
         self._leases: dict[str, _LeaseRecord] = {}
         self._generation = 0
+        self._lifecycle_events: deque[TakeoverLifecycleEvent] = deque(
+            maxlen=max_lifecycle_events
+        )
+        self._lifecycle_counts: dict[str, int] = {}
+
+    @property
+    def lifecycle_events(self) -> tuple[TakeoverLifecycleEvent, ...]:
+        with self._lock:
+            return tuple(self._lifecycle_events)
+
+    @property
+    def lifecycle_counts(self) -> dict[str, int]:
+        with self._lock:
+            return dict(self._lifecycle_counts)
+
+    def _record_event_locked(self, event: str, record: _LeaseRecord) -> None:
+        item = TakeoverLifecycleEvent(
+            event=event,
+            ownership=record.ownership,
+            adapter_id=record.grant.adapter_id,
+        )
+        self._lifecycle_events.append(item)
+        self._lifecycle_counts[event] = self._lifecycle_counts.get(event, 0) + 1
+        logger.info(
+            "browser takeover lifecycle event=%s ownership=%s adapter=%s",
+            item.event,
+            item.ownership,
+            item.adapter_id,
+        )
 
     def acquire(
         self,
@@ -256,6 +300,7 @@ class BrowserTakeoverCoordinator:
                     )
                 record.binding = binding
                 record.ownership = "human"
+                self._record_event_locked("acquired", record)
             return grant
         except Exception:
             if binding is not None:
@@ -265,6 +310,7 @@ class BrowserTakeoverCoordinator:
                     with self._lock:
                         record.binding = binding
                         record.ownership = "revocation_failed"
+                        self._record_event_locked("revocation_failed", record)
                     raise TakeoverRevocationError(
                         "unsafe viewer binding could not be revoked"
                     ) from exc
@@ -435,6 +481,7 @@ class BrowserTakeoverCoordinator:
         except Exception as exc:
             with self._lock:
                 record.ownership = "revocation_failed"
+                self._record_event_locked("revocation_failed", record)
                 record.completion_event.set()
             raise TakeoverRevocationError(
                 "viewer revocation was not confirmed; agent input remains disabled"
@@ -445,6 +492,7 @@ class BrowserTakeoverCoordinator:
         except Exception as exc:
             with self._lock:
                 record.ownership = "observation_failed"
+                self._record_event_locked("observation_failed", record)
                 record.completion_event.set()
             raise BrowserTakeoverError(
                 "post-return browser observation failed; agent input remains disabled"
@@ -467,6 +515,7 @@ class BrowserTakeoverCoordinator:
             record.ownership = (
                 "agent" if observation.state != "browser_lost" else "browser_lost"
             )
+            self._record_event_locked(observation.state, record)
             record.completion_event.set()
             self._prune_terminal_locked()
         return report
@@ -484,6 +533,50 @@ class BrowserTakeoverCoordinator:
             if record.report is None:
                 raise TakeoverConflict("takeover has no terminal report")
             return record.report
+
+    def lease_ownership(self, lease_id: str, scope: TakeoverScope) -> str:
+        """Return one exact lease's safe ownership state for diagnostics."""
+        with self._lock:
+            record = self._leases.get(lease_id)
+            if record is None:
+                raise TakeoverNotFound("takeover lease not found")
+            if record.grant.scope != scope:
+                raise TakeoverScopeMismatch("takeover scope does not exactly match")
+            return record.ownership
+
+    def cancel(self, lease_id: str, scope: TakeoverScope) -> TakeoverCompletionReport:
+        """Revoke one exact lease and record a content-free cancellation."""
+        with self._lock:
+            record = self._leases.get(lease_id)
+            if record is None:
+                raise TakeoverNotFound("takeover lease not found")
+            if record.grant.scope != scope:
+                raise TakeoverScopeMismatch("takeover scope does not exactly match")
+            if record.report is not None:
+                return record.report
+            if record.binding is None or record.ownership != "human":
+                raise TakeoverConflict("takeover is not ready for cancellation")
+            record.ownership = "returning"
+            record.completion_event.clear()
+            binding = record.binding
+        try:
+            record.adapter.revoke(binding)
+        except Exception as exc:
+            with self._lock:
+                record.ownership = "revocation_failed"
+                self._record_event_locked("revocation_failed", record)
+                record.completion_event.set()
+            raise TakeoverRevocationError(
+                "viewer revocation was not confirmed; agent input remains disabled"
+            ) from exc
+        report = TakeoverCompletionReport(lease_id, "canceled", False, "")
+        with self._lock:
+            record.report = report
+            record.ownership = "canceled"
+            self._record_event_locked("canceled", record)
+            record.completion_event.set()
+            self._prune_terminal_locked()
+        return report
 
     def expire_due(
         self,
@@ -561,6 +654,7 @@ class BrowserTakeoverCoordinator:
         except Exception as exc:
             with self._lock:
                 record.ownership = "revocation_failed"
+                self._record_event_locked("revocation_failed", record)
                 record.completion_event.set()
             raise TakeoverRevocationError(
                 "expired viewer revocation was not confirmed; agent input remains disabled"
@@ -571,6 +665,7 @@ class BrowserTakeoverCoordinator:
         except Exception as exc:
             with self._lock:
                 record.ownership = "observation_failed"
+                self._record_event_locked("observation_failed", record)
                 record.completion_event.set()
             raise BrowserTakeoverError(
                 "expired takeover observation failed; agent input remains disabled"
@@ -590,6 +685,7 @@ class BrowserTakeoverCoordinator:
         with self._lock:
             record.report = report
             record.ownership = "expired"
+            self._record_event_locked("expired", record)
             record.completion_event.set()
             self._prune_terminal_locked()
         return report
@@ -615,9 +711,11 @@ class BrowserTakeoverCoordinator:
             except Exception:
                 with self._lock:
                     record.ownership = "revocation_failed"
+                    self._record_event_locked("revocation_failed", record)
             else:
                 with self._lock:
                     record.ownership = "revoked"
+                    self._record_event_locked("revoked", record)
                     self._prune_terminal_locked()
 
     @property

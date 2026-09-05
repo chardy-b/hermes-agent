@@ -5,7 +5,7 @@ import json
 import pytest
 
 from gateway.browser_takeover import BrowserTakeoverCoordinator, TakeoverConflict
-from gateway.browser_takeover_access import TakeoverAccessManager
+from gateway.browser_takeover_access import TakeoverAccessError, TakeoverAccessManager
 from gateway.browser_takeover_delivery import (
     extract_human_assist_required,
     render_human_assist_required,
@@ -121,6 +121,56 @@ def test_service_allows_only_one_active_takeover_per_outer_session(monkeypatch):
         with pytest.raises(TakeoverConflict):
             _issue(service)
     finally:
+        coordinator.reset()
+        with browser_camofox._sessions_lock:
+            browser_camofox._sessions.pop(cache_key, None)
+
+
+def test_shutdown_invalidates_claims_before_revoking_viewer(monkeypatch):
+    coordinator, access, service, cache_key = _configured_service(monkeypatch)
+    try:
+        result = _issue(service)
+        token = result.url.split("#claim=", 1)[1]
+
+        service.shutdown()
+
+        assert access.inspect(result.lease_id).revoked is True
+        assert coordinator.lease_ownership(result.lease_id, result.scope) == "revoked"
+        with pytest.raises(TakeoverAccessError):
+            access.claim(
+                result.lease_id,
+                token,
+                origin="https://takeover.example",
+                scope=result.scope,
+            )
+    finally:
+        coordinator.reset()
+        with browser_camofox._sessions_lock:
+            browser_camofox._sessions.pop(cache_key, None)
+
+
+def test_cancel_from_exact_context_wins_before_done(monkeypatch):
+    coordinator, access, service, cache_key = _configured_service(monkeypatch)
+    install_browser_takeover_service(service)
+    tokens = set_session_vars(
+        platform="telegram",
+        session_id="session-a",
+        profile="profile-a",
+        browser_control_principal="principal-a",
+        browser_control_transport_family="telegram",
+    )
+    try:
+        result = _issue(service)
+        message = _try_complete_browser_takeover_reply("cancel")
+        assert message is not None
+        assert "canceled" in message
+        report = coordinator.completion_report(result.lease_id, result.scope)
+        assert report.outcome == "canceled"
+        assert access.inspect(result.lease_id).revoked is True
+        assert _try_complete_browser_takeover_reply("done") is None
+    finally:
+        clear_session_vars(tokens)
+        install_browser_takeover_service(None)
         coordinator.reset()
         with browser_camofox._sessions_lock:
             browser_camofox._sessions.pop(cache_key, None)

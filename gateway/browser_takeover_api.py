@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import Awaitable, Callable
 from urllib.parse import urlsplit, urlunsplit
 
 from aiohttp import ClientSession, ClientTimeout, WSCloseCode, WSMsgType, web
 
-from gateway.browser_takeover import ViewerProxyTarget
+from gateway.browser_takeover import TakeoverScope, ViewerProxyTarget
 from gateway.browser_takeover_access import (
     TAKEOVER_RESPONSE_HEADERS,
     TakeoverAccessError,
@@ -24,7 +25,9 @@ _ALLOWED_ASSETS = ("vnc.html", "vnc_lite.html")
 _ALLOWED_ASSET_PREFIXES = ("app/", "core/", "vendor/")
 
 HttpFetch = Callable[[ViewerProxyTarget, str], Awaitable[tuple[int, str, bytes]]]
-WebSocketBridge = Callable[[web.Request, str], Awaitable[web.StreamResponse]]
+WebSocketBridge = Callable[
+    [web.Request, str, asyncio.Event], Awaitable[web.StreamResponse]
+]
 
 _HANDOFF_HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
@@ -90,6 +93,11 @@ class BrowserTakeoverAPI:
         self.access = access
         self._http_fetch = http_fetch or self._default_http_fetch
         self._websocket_bridge = websocket_bridge or self._default_websocket_bridge
+        self._connections_lock = threading.RLock()
+        self._connections: dict[
+            str, tuple[asyncio.AbstractEventLoop, asyncio.Event]
+        ] = {}
+        self.access.register_revocation_listener(self._revoke_connections)
 
     def routes(self) -> list[tuple[str, str, Callable]]:
         root = "/v1/browser-takeover/{lease_id}"
@@ -228,14 +236,72 @@ class BrowserTakeoverAPI:
         return response
 
     async def websocket(self, request: web.Request) -> web.StreamResponse:
+        lease_id = request.match_info["lease_id"]
+        connection: tuple[asyncio.AbstractEventLoop, asyncio.Event] | None = None
+        timer: asyncio.TimerHandle | None = None
         try:
-            target = self._authorize(request)
+            scope = self._scope(request)
+            origin = request.headers.get("Origin", "")
+            target = self.access.authorize(
+                lease_id,
+                request.cookies.get(TAKEOVER_COOKIE_NAME, ""),
+                origin=origin,
+                scope=scope,
+            )
+            connection = self._register_connection(lease_id)
+            target = self.access.authorize_websocket(
+                lease_id,
+                request.cookies.get(TAKEOVER_COOKIE_NAME, ""),
+                origin=origin,
+                scope=scope,
+            )
+            loop, revoked = connection
+            timer = loop.call_later(
+                self.access.remaining_lifetime(lease_id, scope), revoked.set
+            )
         except TakeoverAccessError:
+            if connection is not None:
+                self._unregister_connection(lease_id, connection)
             return self._error(403)
         try:
-            return await self._websocket_bridge(request, target.websocket_url)
+            assert connection is not None
+            return await self._websocket_bridge(
+                request, target.websocket_url, connection[1]
+            )
         except Exception:
             return self._error(502)
+        finally:
+            if timer is not None:
+                timer.cancel()
+            if connection is not None:
+                self._unregister_connection(lease_id, connection)
+
+    def _register_connection(
+        self, lease_id: str
+    ) -> tuple[asyncio.AbstractEventLoop, asyncio.Event]:
+        connection = (asyncio.get_running_loop(), asyncio.Event())
+        with self._connections_lock:
+            if lease_id in self._connections:
+                raise TakeoverAccessError("takeover viewer is already connected")
+            self._connections[lease_id] = connection
+        return connection
+
+    def _unregister_connection(
+        self,
+        lease_id: str,
+        connection: tuple[asyncio.AbstractEventLoop, asyncio.Event],
+    ) -> None:
+        with self._connections_lock:
+            if self._connections.get(lease_id) == connection:
+                self._connections.pop(lease_id, None)
+
+    def _revoke_connections(self, lease_id: str, scope: TakeoverScope) -> None:
+        del scope
+        with self._connections_lock:
+            connection = self._connections.get(lease_id)
+        if connection is not None:
+            loop, revoked = connection
+            loop.call_soon_threadsafe(revoked.set)
 
     def _scope(self, request: web.Request, *, allow_terminal: bool = False):
         profile = request.match_info.get("profile") or "default"
@@ -304,7 +370,7 @@ class BrowserTakeoverAPI:
 
     @classmethod
     async def _default_websocket_bridge(
-        cls, request: web.Request, upstream_url: str
+        cls, request: web.Request, upstream_url: str, revoked: asyncio.Event
     ) -> web.StreamResponse:
         downstream = web.WebSocketResponse(
             max_msg_size=16 * 1024 * 1024,
@@ -314,12 +380,30 @@ class BrowserTakeoverAPI:
         await downstream.prepare(request)
         timeout = ClientTimeout(total=None, sock_connect=10)
         async with ClientSession(timeout=timeout, trust_env=False) as session:
-            try:
-                upstream = await session.ws_connect(
+            connect_task = asyncio.create_task(
+                session.ws_connect(
                     upstream_url,
                     max_msg_size=16 * 1024 * 1024,
                     heartbeat=30,
                 )
+            )
+            revoke_while_connecting = asyncio.create_task(revoked.wait())
+            done, _pending = await asyncio.wait(
+                [connect_task, revoke_while_connecting],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if revoke_while_connecting in done:
+                connect_task.cancel()
+                await asyncio.gather(connect_task, return_exceptions=True)
+                await downstream.close(
+                    code=WSCloseCode.POLICY_VIOLATION,
+                    message=b"viewer access revoked",
+                )
+                return downstream
+            revoke_while_connecting.cancel()
+            await asyncio.gather(revoke_while_connecting, return_exceptions=True)
+            try:
+                upstream = connect_task.result()
             except Exception:
                 await downstream.close(
                     code=WSCloseCode.INTERNAL_ERROR,
@@ -349,6 +433,7 @@ class BrowserTakeoverAPI:
                 tasks = [
                     asyncio.create_task(to_upstream()),
                     asyncio.create_task(to_downstream()),
+                    asyncio.create_task(revoked.wait()),
                 ]
                 done, pending = await asyncio.wait(
                     tasks, return_when=asyncio.FIRST_COMPLETED
@@ -356,5 +441,14 @@ class BrowserTakeoverAPI:
                 for task in pending:
                     task.cancel()
                 await asyncio.gather(*done, *pending, return_exceptions=True)
+                if revoked.is_set():
+                    await upstream.close(
+                        code=WSCloseCode.POLICY_VIOLATION,
+                        message=b"viewer access revoked",
+                    )
+                    await downstream.close(
+                        code=WSCloseCode.POLICY_VIOLATION,
+                        message=b"viewer access revoked",
+                    )
         await downstream.close()
         return downstream

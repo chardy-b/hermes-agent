@@ -8260,7 +8260,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 uninstall_browser_takeover_service,
             )
 
-            uninstall_browser_takeover_service(self._browser_takeover_service)
+            service = self._browser_takeover_service
+            service.shutdown()
+            uninstall_browser_takeover_service(service)
             self._browser_takeover_service = None
         if self._response_store is not None:
             try:
