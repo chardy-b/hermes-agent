@@ -272,6 +272,48 @@ class BrowserTakeoverCoordinator:
                 self._leases.pop(lease_id, None)
             raise
 
+    def active_grant_for_session(
+        self,
+        *,
+        principal_id: str,
+        profile_id: str,
+        hermes_session_id: str,
+        transport_family: str,
+    ) -> Optional[TakeoverGrant]:
+        """Return the sole active grant for one exact outer session.
+
+        Browser identities stay inside the coordinator. Multiple active browsers
+        in one outer session are ambiguous and therefore fail closed.
+        """
+        identity = tuple(
+            str(value or "").strip()
+            for value in (
+                principal_id,
+                profile_id,
+                hermes_session_id,
+                transport_family,
+            )
+        )
+        if not all(identity):
+            return None
+        principal, profile, session, transport = identity
+        self.expire_due(hermes_session_id=session)
+        with self._lock:
+            matches = [
+                record.grant
+                for record in self._leases.values()
+                if record.ownership in _ACTIVE_OWNERSHIP
+                and record.grant.scope.principal_id == principal
+                and record.grant.scope.profile_id == profile
+                and record.grant.scope.hermes_session_id == session
+                and record.grant.scope.transport_family == transport
+            ]
+        if len(matches) > 1:
+            raise TakeoverConflict(
+                "multiple browser takeovers are active for this session"
+            )
+        return matches[0] if matches else None
+
     def guard_browser_action(
         self,
         *,

@@ -2873,6 +2873,26 @@ atexit.register(_stop_browser_cleanup_thread)
 
 BROWSER_TOOL_SCHEMAS = [
     {
+        "name": "browser_human_assist",
+        "description": (
+            "Request one private, time-limited human takeover link for the active "
+            "browser session when a verification, authentication, consent, or other "
+            "private human-only step blocks progress. Never include page text, "
+            "credentials, challenge content, cookies, or browser state."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "enum": ["verification", "authentication", "consent", "other"],
+                    "description": "Coarse reason category only; never challenge content.",
+                }
+            },
+            "required": ["reason"],
+        },
+    },
+    {
         "name": "browser_navigate",
         "description": "Navigate to a URL in the browser. Initializes the session and loads the page. Must be called before other browser tools. For simple information retrieval, prefer web_search or web_extract (faster, cheaper). For plain-text endpoints — URLs ending in .md, .txt, .json, .yaml, .yml, .csv, .xml, raw.githubusercontent.com, or any documented API endpoint — prefer curl via the terminal tool or web_extract; the browser stack is overkill and much slower for these. Use browser tools when you need to interact with a page (click, fill forms, dynamic content). Returns a compact page snapshot with interactive elements and ref IDs — no need to call browser_snapshot separately after navigating.",
         "parameters": {
@@ -5430,6 +5450,46 @@ def _maybe_stop_recording(task_id: str):
             _recording_sessions.discard(task_id)
 
 
+def browser_human_assist(
+    reason: str = "other",
+    task_id: Optional[str] = None,
+) -> str:
+    """Acquire a scoped human-control link for the active Camofox session."""
+    from gateway.browser_takeover_service import get_browser_takeover_service
+
+    service = get_browser_takeover_service()
+    if service is None:
+        return json.dumps(
+            {
+                "success": False,
+                "error": {
+                    "code": "human_assist_unavailable",
+                    "message": "Secure browser human assistance is not configured.",
+                },
+            }
+        )
+    try:
+        result = service.issue_human_assist_from_context(
+            reason=reason,
+            task_id=task_id,
+        )
+    except Exception as exc:
+        from gateway.browser_takeover import BrowserTakeoverError
+
+        if isinstance(exc, (BrowserTakeoverError, ValueError)):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": {
+                        "code": "human_assist_unavailable",
+                        "message": "Secure browser human assistance is unavailable for this session.",
+                    },
+                }
+            )
+        raise
+    return json.dumps(result.to_dict())
+
+
 def browser_get_images(task_id: Optional[str] = None) -> str:
     """
     Get all images on the current page.
@@ -6592,6 +6652,17 @@ registry.register(
     emoji="⌨️",
 )
 
+registry.register(
+    name="browser_human_assist",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_human_assist"],
+    handler=lambda args, **kw: browser_human_assist(
+        reason=args.get("reason", "other"),
+        task_id=kw.get("task_id"),
+    ),
+    check_fn=check_browser_requirements,
+    emoji="🤝",
+)
 registry.register(
     name="browser_get_images",
     toolset="browser",

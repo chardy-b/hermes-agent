@@ -226,6 +226,40 @@ def test_human_completion_revokes_cookie_and_is_idempotent():
         )
 
 
+def test_trusted_session_completion_revokes_unclaimed_link_before_resume():
+    class InspectingAdapter(Adapter):
+        manager: TakeoverAccessManager | None = None
+        lease_id = ""
+
+        def observe(self, binding):
+            assert self.manager is not None
+            assert self.manager.inspect(self.lease_id).revoked is True
+            return super().observe(binding)
+
+    coordinator = BrowserTakeoverCoordinator()
+    adapter = InspectingAdapter()
+    grant = coordinator.acquire(SCOPE, adapter, ttl_seconds=60)
+    manager = TakeoverAccessManager(
+        coordinator,
+        base_url="https://takeover.example",
+    )
+    manager.issue(grant.lease_id, SCOPE, ttl_seconds=60)
+    adapter.manager = manager
+    adapter.lease_id = grant.lease_id
+
+    report = manager.complete_scoped(grant.lease_id, SCOPE)
+
+    assert report.outcome == "still_blocked"
+    assert manager.inspect(grant.lease_id).revoked is True
+    assert (
+        coordinator.guard_browser_action(
+            hermes_session_id=SCOPE.hermes_session_id,
+            browser_session_id=SCOPE.browser_session_id,
+        )
+        is None
+    )
+
+
 def test_expired_cookie_reports_expired_without_releasing_agent_input():
     clock = [100.0]
     coordinator = BrowserTakeoverCoordinator(clock=lambda: 100.0)
@@ -284,7 +318,7 @@ def test_expired_cookie_reports_expired_without_releasing_agent_input():
         )
 
 
-def test_concurrent_human_completion_revokes_once_and_returns_one_report():
+def test_concurrent_page_and_trusted_completion_revoke_once():
     class BlockingAdapter(Adapter):
         def __init__(self):
             self.revoke_calls = 0
@@ -328,8 +362,14 @@ def test_concurrent_human_completion_revokes_once_and_returns_one_report():
         except Exception as exc:
             errors.append(exc)
 
+    def finish_scoped():
+        try:
+            reports.append(manager.complete_scoped(grant.lease_id, SCOPE))
+        except Exception as exc:
+            errors.append(exc)
+
     first = threading.Thread(target=finish)
-    second = threading.Thread(target=finish)
+    second = threading.Thread(target=finish_scoped)
     first.start()
     assert adapter.entered.wait(2)
     second.start()

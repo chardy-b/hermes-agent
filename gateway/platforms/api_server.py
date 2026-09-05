@@ -1567,7 +1567,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 from gateway.browser_takeover import get_browser_takeover_coordinator
                 from gateway.browser_takeover_access import TakeoverAccessManager
                 from gateway.browser_takeover_api import BrowserTakeoverAPI
-                from gateway.browser_takeover_service import BrowserTakeoverService
+                from gateway.browser_takeover_service import (
+                    BrowserTakeoverService,
+                    install_browser_takeover_service,
+                )
 
                 public_origin = str(takeover_config.get("public_origin") or "").strip()
                 try:
@@ -1591,9 +1594,13 @@ class APIServerAdapter(BasePlatformAdapter):
                                 access,
                                 adapter_id=adapter_id,
                             )
+                            install_browser_takeover_service(
+                                self._browser_takeover_service
+                            )
                         except ValueError:
+                            self._browser_takeover_service = None
                             logger.error(
-                                "[%s] browser takeover acquisition disabled: unsupported adapter",
+                                "[%s] browser takeover acquisition disabled: adapter or service registration conflict",
                                 self.name,
                             )
         self._app: Optional["web.Application"] = None
@@ -3639,6 +3646,7 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id = str(payload.get("session_id") or "").strip()
         browser_profile_id = str(payload.get("browser_profile_id") or "").strip()
         browser_session_id = str(payload.get("browser_session_id") or "").strip()
+        reason = str(payload.get("reason") or "other")
         ttl_seconds = payload.get("ttl_seconds", 300)
         acquire_new = self._browser_takeover_service is not None and not lease_id
         if (
@@ -3690,12 +3698,13 @@ class APIServerAdapter(BasePlatformAdapter):
         adapter_id = ""
         if acquire_new:
             try:
-                issued = await asyncio.to_thread(
-                    self._browser_takeover_service.issue_for_session,
+                assist = await asyncio.to_thread(
+                    self._browser_takeover_service.issue_human_assist_for_session,
                     principal_id=principal_id,
                     profile_id=profile,
                     hermes_session_id=session_id,
                     transport_family=transport_family,
+                    reason=reason,
                     ttl_seconds=float(ttl_seconds),
                 )
             except (BrowserTakeoverError, TakeoverAccessError, ValueError):
@@ -3707,9 +3716,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=409,
                     headers=TAKEOVER_RESPONSE_HEADERS,
                 )
-            scope = issued.grant.scope
-            link = issued.link
-            adapter_id = issued.grant.adapter_id
+            response_payload = assist.to_dict()
         else:
             scope = TakeoverScope(
                 principal_id=principal_id,
@@ -3733,21 +3740,18 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=403,
                     headers=TAKEOVER_RESPONSE_HEADERS,
                 )
+            from gateway.browser_takeover_service import HumanAssistRequired
+
+            response_payload = HumanAssistRequired.from_link(
+                lease_id=link.lease_id,
+                url=link.url,
+                expires_at=link.expires_at,
+                adapter_id=adapter_id,
+                scope=scope,
+                reason=reason,
+            ).to_dict()
         return web.json_response(
-            {
-                "lease_id": link.lease_id,
-                "url": link.url,
-                "expires_at": link.expires_at,
-                "adapter_id": adapter_id,
-                "scope": {
-                    "principal_id": scope.principal_id,
-                    "profile_id": scope.profile_id,
-                    "session_id": scope.hermes_session_id,
-                    "browser_profile_id": scope.browser_profile_id,
-                    "browser_session_id": scope.browser_session_id,
-                    "transport_family": scope.transport_family,
-                },
-            },
+            response_payload,
             status=201,
             headers=TAKEOVER_RESPONSE_HEADERS,
         )
@@ -8251,6 +8255,13 @@ class APIServerAdapter(BasePlatformAdapter):
         (OSError: [Errno 24] Too many open files, #37011).
         """
         self._mark_disconnected()
+        if self._browser_takeover_service is not None:
+            from gateway.browser_takeover_service import (
+                uninstall_browser_takeover_service,
+            )
+
+            uninstall_browser_takeover_service(self._browser_takeover_service)
+            self._browser_takeover_service = None
         if self._response_store is not None:
             try:
                 self._response_store.close()

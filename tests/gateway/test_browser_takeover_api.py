@@ -6,6 +6,7 @@ from urllib.parse import urlsplit
 
 from aiohttp import WSMsgType, web
 from aiohttp.test_utils import TestClient, TestServer
+import pytest
 
 from gateway.browser_takeover import (
     BrowserObservation,
@@ -16,8 +17,19 @@ from gateway.browser_takeover import (
 )
 from gateway.browser_takeover_access import TakeoverAccessManager
 from gateway.browser_takeover_api import BrowserTakeoverAPI, TAKEOVER_COOKIE_NAME
+from gateway.browser_takeover_service import (
+    get_browser_takeover_service,
+    install_browser_takeover_service,
+)
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
+
+
+@pytest.fixture(autouse=True)
+def _clear_takeover_service_registry():
+    install_browser_takeover_service(None)
+    yield
+    install_browser_takeover_service(None)
 
 
 SCOPE = TakeoverScope(
@@ -535,6 +547,7 @@ async def _authenticated_issue_scenario(monkeypatch):
         "principal_id": "attacker-supplied",
         "profile_id": "attacker-supplied",
         "transport_family": "attacker-supplied",
+        "reason": "raw CAPTCHA prompt from the page",
     }
     async with TestClient(TestServer(app)) as client:
         denied = await client.post("/v1/browser-takeover/issue", json=payload)
@@ -547,6 +560,10 @@ async def _authenticated_issue_scenario(monkeypatch):
 
     assert denied.status == 401
     assert issued.status == 201
+    assert body["status"] == "human_assist_required"
+    assert body["done_label"] == "Done"
+    assert body["reason"] == "human_input_required"
+    assert "raw CAPTCHA" not in str(body)
     assert body["lease_id"] == grant.lease_id
     assert body["url"].startswith(
         f"https://takeover.example/p/default/v1/browser-takeover/{grant.lease_id}#claim="
@@ -555,6 +572,7 @@ async def _authenticated_issue_scenario(monkeypatch):
     assert body["scope"] == {
         "principal_id": scope.principal_id,
         "profile_id": scope.profile_id,
+        "hermes_session_id": scope.hermes_session_id,
         "session_id": scope.hermes_session_id,
         "browser_profile_id": scope.browser_profile_id,
         "browser_session_id": scope.browser_session_id,
@@ -632,6 +650,7 @@ async def _authenticated_camofox_acquire_scenario(monkeypatch):
             body = await issued.json()
 
         assert issued.status == 201
+        assert body["status"] == "human_assist_required"
         assert body["adapter_id"] == "camofox-vnc"
         assert body["scope"]["session_id"] == session_id
         assert body["scope"]["browser_session_id"] == session_id
@@ -656,9 +675,12 @@ async def _authenticated_camofox_acquire_scenario(monkeypatch):
         assert blocked["ownership"] == "human"
         target = coordinator.viewer_proxy_target(body["lease_id"], scope)
         assert target.adapter_id == "camofox-vnc"
+        assert get_browser_takeover_service() is adapter._browser_takeover_service
         assert "6087" not in str(body)
         assert "managed-tab" not in str(body)
     finally:
+        await adapter.disconnect()
+        assert get_browser_takeover_service() is None
         coordinator.reset()
         with browser_camofox._sessions_lock:
             browser_camofox._sessions.pop(cache_key, None)

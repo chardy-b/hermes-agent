@@ -335,6 +335,55 @@ class TakeoverAccessManager:
         if wait_event is not None:
             return self._wait_for_completion(record, supplied, wait_event)
 
+        return self._complete_coordinator(record, lease_id, scope)
+
+    def complete_scoped(
+        self,
+        lease_id: str,
+        scope: TakeoverScope,
+    ) -> TakeoverCompletionReport:
+        """Complete from an already-authenticated exact gateway session.
+
+        This path intentionally does not accept a browser cookie. The caller must
+        first resolve the full scope from trusted session context. Edge claim and
+        cookie material is revoked under the access lock before the coordinator
+        can return ownership to the agent.
+        """
+        wait_event: Optional[threading.Event] = None
+        with self._lock:
+            record = self._record(lease_id)
+            self._check_scope(record, scope)
+            if record.completion_report is not None:
+                return record.completion_report
+            if record.completion_failed:
+                raise TakeoverCompletionFailed(
+                    "takeover completion did not return browser ownership"
+                )
+            if record.completing:
+                wait_event = record.completion_event
+            else:
+                target = self._target(lease_id, scope)
+                if not hmac.compare_digest(
+                    record.target_digest, self._target_digest(target)
+                ):
+                    raise TakeoverClaimInvalid("takeover claim is not valid")
+                record.completing = True
+                record.revoked = True
+                record.claim_digest = b""
+                record.completion_cookie_digest = record.cookie_digest
+                record.cookie_digest = None
+                record.completion_event.clear()
+
+        if wait_event is not None:
+            return self._wait_for_scoped_completion(record, wait_event)
+        return self._complete_coordinator(record, lease_id, scope)
+
+    def _complete_coordinator(
+        self,
+        record: _AccessRecord,
+        lease_id: str,
+        scope: TakeoverScope,
+    ) -> TakeoverCompletionReport:
         try:
             report = self._coordinator.complete(lease_id, scope)
         except TakeoverExpired:
@@ -442,6 +491,20 @@ class TakeoverAccessManager:
                     "takeover completion did not return browser ownership"
                 )
             return report
+
+    def _wait_for_scoped_completion(
+        self,
+        record: _AccessRecord,
+        event: threading.Event,
+    ) -> TakeoverCompletionReport:
+        if not event.wait(self._completion_wait_timeout):
+            raise TakeoverCompletionFailed("takeover completion is still in progress")
+        with self._lock:
+            if record.completion_failed or record.completion_report is None:
+                raise TakeoverCompletionFailed(
+                    "takeover completion did not return browser ownership"
+                )
+            return record.completion_report
 
     def _expired_completion_locked(
         self,

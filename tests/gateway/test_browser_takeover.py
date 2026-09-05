@@ -128,6 +128,37 @@ def test_lease_is_exact_scoped_and_hides_viewer_endpoints():
     }
 
 
+def test_active_grant_lookup_finds_exact_outer_session():
+    coordinator = BrowserTakeoverCoordinator()
+    grant = coordinator.acquire(SCOPE, RecordingAdapter())
+    found = coordinator.active_grant_for_session(
+        principal_id=SCOPE.principal_id,
+        profile_id=SCOPE.profile_id,
+        hermes_session_id=SCOPE.hermes_session_id,
+        transport_family=SCOPE.transport_family,
+    )
+    assert found == grant
+    assert (
+        coordinator.active_grant_for_session(
+            principal_id="other",
+            profile_id=SCOPE.profile_id,
+            hermes_session_id=SCOPE.hermes_session_id,
+            transport_family=SCOPE.transport_family,
+        )
+        is None
+    )
+    coordinator.complete(grant.lease_id, SCOPE)
+    assert (
+        coordinator.active_grant_for_session(
+            principal_id=SCOPE.principal_id,
+            profile_id=SCOPE.profile_id,
+            hermes_session_id=SCOPE.hermes_session_id,
+            transport_family=SCOPE.transport_family,
+        )
+        is None
+    )
+
+
 def test_partial_scope_cannot_complete_or_release_agent_input():
     coordinator = BrowserTakeoverCoordinator()
     adapter = RecordingAdapter()
