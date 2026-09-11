@@ -105,6 +105,31 @@ def retrieval_skills(tmp_path):
     return tmp_path, android_dir
 
 
+def test_org_projection_preserves_upstream_trust_header(tmp_path, monkeypatch):
+    from agent.skill_utils import ORG_ACTIVE_MARKER, ORG_MIRROR_DIR_NAME
+    from tools import skills_tool
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    root = tmp_path / "skills"
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", root)
+    mirror = root / ORG_MIRROR_DIR_NAME
+    skill = mirror / "test-org" / "shared-guide"
+    skill.mkdir(parents=True)
+    (mirror / ORG_ACTIVE_MARKER).write_text("test-org", encoding="utf-8")
+    (skill / "SKILL.md").write_text(
+        _frontmatter("shared-guide")
+        + "## Selected\nSELECTED-PROCEDURE\n\n## Other\nOMITTED-PROCEDURE\n",
+        encoding="utf-8",
+    )
+    result = json.loads(skill_view("shared-guide", heading="Selected", max_chars=1000))
+    assert result["success"] is True
+    assert result["org_provenance"]["org_id"] == "test-org"
+    assert "ORG-SHARED SKILL" in result["content"]
+    assert "third-party instructions" in result["content"]
+    assert "SELECTED-PROCEDURE" in result["content"]
+    assert "OMITTED-PROCEDURE" not in result["content"]
+
+
 def test_android_and_hermes_routers_select_metadata_without_body_leakage(retrieval_skills):
     root, android_dir = retrieval_skills
     sentinel = android_dir / "SHOULD-NOT-EXIST"
