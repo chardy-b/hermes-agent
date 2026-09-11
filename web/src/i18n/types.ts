@@ -462,6 +462,13 @@ export interface Translations {
     skillCount: string;
     resultCount: string;
     noDescription: string;
+    sort: string;
+    sortName: string;
+    sortSize: string;
+    sortCalls: string;
+    characters: string;
+    calls: string;
+    callMetricHelp: string;
     toolsets: string;
     toolsetLabel: string;
     noToolsetsMatch: string;
