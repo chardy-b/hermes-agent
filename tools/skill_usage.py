@@ -126,6 +126,11 @@ def activity_count(record: Dict[str, Any]) -> int:
     return sum(_int_or_zero(record.get(key)) for key in ("use_count", "view_count", "patch_count"))
 
 
+def use_count(record: Dict[str, Any]) -> int:
+    """Recorded skill loads, excluding view-only and patch events."""
+    return _non_negative_int(record.get("use_count"))
+
+
 # --- Provenance — which skills are agent-created (and thus eligible for curation) ---
 def _read_bundled_manifest_names() -> Set[str]:
     """Names from ``.bundled_manifest`` ("name:hash" per line); empty if missing/unreadable."""

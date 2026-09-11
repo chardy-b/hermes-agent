@@ -2324,6 +2324,8 @@ export interface SkillInfo {
   description: string;
   category: string;
   enabled: boolean;
+  character_count: number;
+  call_count: number;
 }
 
 export interface SkillContent {
