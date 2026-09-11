@@ -203,7 +203,7 @@ def test_max_skills_limits_unique_names_but_scanned_duplicate_is_reported(tmp_pa
     assert report["duplicates"] == [{"name": "a", "discarded": str(duplicate), "selected": str(winner)}]
 
 
-def test_malformed_data_is_safe_and_protection_blocks_candidates(tmp_path):
+def test_malformed_data_is_safe_and_pinning_blocks_candidates(tmp_path):
     _skill(tmp_path, "alpha", body="x\n" * 500)
     _skill(tmp_path, "plan", body="x\n" * 500)
     malformed = tmp_path / "malformed"
@@ -219,8 +219,9 @@ def test_malformed_data_is_safe_and_protection_blocks_candidates(tmp_path):
     assert "pinned" in alpha["protected_reasons"]
     assert alpha["shortening_candidate"] is False
     plan = _row(report, "plan")
-    assert plan["protected_builtin"] is True
-    assert plan["shortening_candidate"] is False
+    # ``plan`` is a built-in command, not a protected skill on disk.
+    assert plan["protected_builtin"] is False
+    assert plan["shortening_candidate"] is True
     assert _row(report, "malformed")["name"] == "malformed"
 
 

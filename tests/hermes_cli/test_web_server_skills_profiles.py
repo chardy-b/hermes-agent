@@ -9,6 +9,8 @@ profile's HERMES_HOME, and the dashboard's own profile stays untouched.
 """
 import pytest
 import yaml
+import hermes_cli.web_server_gateway as _web_server_gateway
+import hermes_cli.web_server_profiles as _web_server_profiles
 
 
 def _write_skill(skills_dir, name, description="test skill"):
@@ -64,6 +66,53 @@ def _load_cfg(home):
 
 class TestProfileScopedSkills:
 
+    def test_list_exposes_full_skill_size_and_recorded_calls(
+        self, client, isolated_profiles, monkeypatch
+    ):
+        import tools.skill_usage as skill_usage
+
+        skill_md = isolated_profiles["worker_alpha"] / "skills" / "worker-skill" / "SKILL.md"
+        skill_md.write_text(
+            "---\nname: worker-skill\ndescription: measured\n---\n\n# Worker\n\nπ\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            skill_usage,
+            "load_usage",
+            lambda: {
+                "worker-skill": {
+                    "use_count": 7,
+                    "view_count": 11,
+                    "patch_count": 3,
+                }
+            },
+        )
+
+        resp = client.get("/api/skills", params={"profile": "worker_alpha"})
+
+        assert resp.status_code == 200
+        worker = next(skill for skill in resp.json() if skill["name"] == "worker-skill")
+        assert worker["character_count"] == len(skill_md.read_text(encoding="utf-8"))
+        assert worker["call_count"] == 7
+        assert worker["usage"] == 21
+
+    def test_list_normalizes_invalid_call_counts_to_zero(
+        self, client, isolated_profiles, monkeypatch
+    ):
+        import tools.skill_usage as skill_usage
+
+        monkeypatch.setattr(
+            skill_usage,
+            "load_usage",
+            lambda: {"worker-skill": {"use_count": True}},
+        )
+
+        resp = client.get("/api/skills", params={"profile": "worker_alpha"})
+
+        assert resp.status_code == 200
+        worker = next(skill for skill in resp.json() if skill["name"] == "worker-skill")
+        assert worker["call_count"] == 0
+
 
     def test_toggle_writes_into_target_profile_only(self, client, isolated_profiles):
         resp = client.put(
@@ -109,7 +158,7 @@ class TestProfileScopedHubActions:
             calls.append((list(subcommand), name))
             return _FakeProc()
 
-        monkeypatch.setattr(web_server, "_spawn_hermes_action", _fake_spawn)
+        monkeypatch.setattr(_web_server_gateway, "_spawn_hermes_action", _fake_spawn)
         resp = client.post(
             "/api/skills/hub/install",
             json={"identifier": "official/demo", "profile": "worker_alpha"},
@@ -118,7 +167,7 @@ class TestProfileScopedHubActions:
         assert calls == [
             (
                 ["-p", "worker_alpha", "skills", "install", "official/demo", "--yes"],
-                web_server._hub_action_name("install", "official/demo"),
+                _web_server_profiles._hub_action_name("install", "official/demo"),
             )
         ]
 

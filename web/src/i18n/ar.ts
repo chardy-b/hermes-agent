@@ -316,6 +316,13 @@ export const ar = defineLocale({
     skillCount: "{count} مهارة{s}",
     resultCount: "{count} نتيجة{s}",
     noDescription: "لا يوجد وصف متاح.",
+    sort: "فرز",
+    sortName: "الاسم",
+    sortSize: "الأكبر",
+    sortCalls: "الأكثر استدعاءً",
+    characters: "حرف",
+    calls: "استدعاء",
+    callMetricHelp: "الاستدعاءات هي عمليات تحميل المهارة المسجلة؛ لا تشمل المشاهدات والتعديلات.",
     toolsets: "مجموعات الأدوات",
     toolsetLabel: "مجموعة أدوات {name}",
     noToolsetsMatch: "لا توجد مجموعات أدوات تطابق البحث.",
@@ -553,6 +560,12 @@ export const ar = defineLocale({
       "تتيح اللوحات فصل تدفقات العمل غير المرتبطة — واحدة لكل مشروع أو مستودع أو مجال.",
     slug: "المعرِّف",
     slugHint: "— أحرف صغيرة، واصلات، مثال atm10-server",
+    confirmDoneMany:
+      "Mark {n} tasks as done? The workers' claims are released and dependent children become ready.",
+    confirmArchiveMany:
+      "Archive {n} tasks? They disappear from the default board view.",
+    confirmBlockedMany:
+      "Mark {n} tasks as blocked? The workers' claims are released.",
     displayName: "الاسم المعروض",
     displayNameHint: "(اختياري)",
     description: "الوصف",

@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 
 import tools.skills_tool as skills_tool
+import tools.skills_tool_dedup as skills_dedup
 from tools.skills_tool import _skill_view_with_bump, reset_skill_view_dedup
 
 
@@ -232,14 +233,14 @@ class TestSkillViewDedup:
         hook("task-a")
 
     def test_entry_and_alias_caps_are_fifo(self, skills_home, monkeypatch):
-        monkeypatch.setattr(skills_tool, "_SKILL_VIEW_DEDUP_CAP", 2)
-        monkeypatch.setattr(skills_tool, "_SKILL_VIEW_SCOPE_ALIAS_CAP", 2)
+        monkeypatch.setattr(skills_dedup, "_SKILL_VIEW_DEDUP_CAP", 2)
+        monkeypatch.setattr(skills_dedup, "_SKILL_VIEW_SCOPE_ALIAS_CAP", 2)
         _view(heading="Alpha", task="one", session="s-one")
         _view(heading="Beta", task="two", session="s-two")
         _view(query="procedure", task="three", session="s-three")
-        assert "session:s-one" not in skills_tool._skill_view_tracker
-        assert len(skills_tool._skill_view_tracker["session:s-three"]) == 1
-        assert list(skills_tool._skill_view_scope_tasks) == ["two", "three"]
+        assert "session:s-one" not in skills_dedup._skill_view_tracker
+        assert len(skills_dedup._skill_view_tracker["session:s-three"]) == 1
+        assert list(skills_dedup._skill_view_scope_tasks) == ["two", "three"]
 
     def test_concurrent_identical_calls_atomically_return_one_full_one_stub(self, skills_home):
         reset_skill_view_dedup()

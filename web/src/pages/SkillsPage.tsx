@@ -62,6 +62,8 @@ import { Input } from "@nous-research/ui/ui/components/input";
 import { useI18n } from "@/i18n";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { PluginSlot } from "@/plugins";
+import { sortSkills } from "@/lib/skill-sort";
+import type { SkillSort } from "@/lib/skill-sort";
 
 /* ------------------------------------------------------------------ */
 /*  Types & helpers                                                    */
@@ -132,6 +134,7 @@ export default function SkillsPage() {
   const [search, setSearch] = useState("");
   const [view, setView] = useState<"skills" | "toolsets" | "hub">("skills");
   const [activeCategory, setActiveCategory] = useState<string | null>(null);
+  const [skillSort, setSkillSort] = useState<SkillSort>("name");
   const [togglingSkills, setTogglingSkills] = useState<Set<string>>(new Set());
   const [configToolset, setConfigToolset] = useState<ToolsetInfo | null>(null);
   // Skill editor dialog: open + which skill is being edited (null = create).
@@ -267,26 +270,28 @@ export default function SkillsPage() {
 
   const searchMatchedSkills = useMemo(() => {
     if (!isSearching) return [];
-    return skills.filter(
-      (s) =>
-        s.name.toLowerCase().includes(lowerSearch) ||
-        s.description.toLowerCase().includes(lowerSearch) ||
-        (s.category ?? "").toLowerCase().includes(lowerSearch),
+    return sortSkills(
+      skills.filter(
+        (s) =>
+          s.name.toLowerCase().includes(lowerSearch) ||
+          s.description.toLowerCase().includes(lowerSearch) ||
+          (s.category ?? "").toLowerCase().includes(lowerSearch),
+      ),
+      skillSort,
     );
-  }, [skills, isSearching, lowerSearch]);
+  }, [skills, isSearching, lowerSearch, skillSort]);
 
   const activeSkills = useMemo(() => {
     if (isSearching) return [];
-    if (!activeCategory)
-      return [...skills].sort((a, b) => a.name.localeCompare(b.name));
-    return skills
-      .filter((s) =>
-        activeCategory === "__none__"
-          ? !s.category
-          : s.category === activeCategory,
-      )
-      .sort((a, b) => a.name.localeCompare(b.name));
-  }, [skills, activeCategory, isSearching]);
+    const visible = !activeCategory
+      ? skills
+      : skills.filter((s) =>
+          activeCategory === "__none__"
+            ? !s.category
+            : s.category === activeCategory,
+        );
+    return sortSkills(visible, skillSort);
+  }, [skills, activeCategory, isSearching, skillSort]);
 
   const allCategories = useMemo(() => {
     const cats = new Map<string, number>();
@@ -508,7 +513,7 @@ export default function SkillsPage() {
             /* Skills list */
             <Card className="rounded-none">
               <CardHeader className="py-3 px-4">
-                <div className="flex items-center justify-between">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                   <CardTitle className="text-sm flex items-center gap-2">
                     <Package className="h-4 w-4" />
                     {activeCategory
@@ -518,7 +523,19 @@ export default function SkillsPage() {
                         )
                       : t.skills.all}
                   </CardTitle>
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                      <span>{t.skills.sort}</span>
+                      <select
+                        className="h-8 border border-border bg-background px-2 text-xs text-foreground"
+                        value={skillSort}
+                        onChange={(event) => setSkillSort(event.target.value as SkillSort)}
+                      >
+                        <option value="name">{t.skills.sortName}</option>
+                        <option value="size">{t.skills.sortSize}</option>
+                        <option value="calls">{t.skills.sortCalls}</option>
+                      </select>
+                    </label>
                     <Badge tone="secondary" className="text-xs">
                       {t.skills.skillCount
                         .replace("{count}", String(activeSkills.length))
@@ -740,16 +757,18 @@ function SkillRow({
   onEdit,
   noDescriptionLabel,
 }: SkillRowProps) {
+  const { t } = useI18n();
   return (
-    <div className="group flex items-start gap-3 px-3 py-2.5 transition-colors hover:bg-muted/40">
+    <div className="group flex flex-wrap items-start gap-3 px-3 py-2.5 transition-colors hover:bg-muted/40">
       <div className="pt-0.5 shrink-0">
         <Switch
           checked={skill.enabled}
           onCheckedChange={onToggle}
           disabled={toggling}
+          aria-label={`${skill.enabled ? "Disable" : "Enable"} ${skill.name}`}
         />
       </div>
-      <div className="flex-1 min-w-0">
+      <div className="min-w-40 flex-1">
         <div className="flex items-center gap-2 mb-0.5">
           <span
             className={`font-mono-ui text-sm ${
@@ -762,6 +781,13 @@ function SkillRow({
         <p className="text-xs text-muted-foreground leading-relaxed line-clamp-2">
           {skill.description || noDescriptionLabel}
         </p>
+      </div>
+      <div
+        className="order-last ml-10 flex w-full items-center gap-3 text-xs leading-4 text-muted-foreground sm:order-none sm:ml-0 sm:w-auto sm:block sm:text-right"
+        title={t.skills.callMetricHelp}
+      >
+        <div>{skill.character_count.toLocaleString()} {t.skills.characters}</div>
+        <div>{skill.call_count.toLocaleString()} {t.skills.calls}</div>
       </div>
       <Button
         ghost

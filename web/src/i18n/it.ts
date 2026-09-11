@@ -371,6 +371,13 @@ export const it: Translations = {
     skillCount: "{count} competenz{s}",
     resultCount: "{count} risultat{s}",
     noDescription: "Nessuna descrizione disponibile.",
+    sort: "Ordina",
+    sortName: "Nome",
+    sortSize: "Più grande",
+    sortCalls: "Più chiamate",
+    characters: "caratteri",
+    calls: "chiamate",
+    callMetricHelp: "Le chiamate sono caricamenti registrati della skill; visualizzazioni e modifiche sono escluse.",
     toolsets: "Toolset",
     toolsetLabel: "Toolset {name}",
     noToolsetsMatch: "Nessun toolset corrisponde alla ricerca.",
@@ -469,6 +476,8 @@ export const it: Translations = {
     copyCliCommand: "Copia comando CLI (per uso esterno / fallback)",
     connect: "Connetti",
     sessionExpires: "La sessione scade tra {time}",
+    sessionExpiredNoError:
+      "L'accesso è scaduto senza raggiungere il provider. Di solito significa che la pagina di accesso si è bloccata nella scheda aperta (problema lato server): completa l'accesso lì, poi fai clic su Riprova. Se continua a fallire, usa una chiave API o la CLI.",
     initiatingLogin: "Avvio del flusso di accesso…",
     exchangingCode: "Scambio del codice per i token…",
     connectedClosing: "Connesso! Chiusura…",
@@ -617,6 +626,12 @@ export const it: Translations = {
       "Le bacheche ti permettono di separare flussi di lavoro non correlati — una per progetto, repository o dominio. I worker su una bacheca non vedono mai le attività di un'altra.",
     slug: "Slug",
     slugHint: "— minuscolo, trattini, ad es. atm10-server",
+    confirmDoneMany:
+      "Mark {n} tasks as done? The workers' claims are released and dependent children become ready.",
+    confirmArchiveMany:
+      "Archive {n} tasks? They disappear from the default board view.",
+    confirmBlockedMany:
+      "Mark {n} tasks as blocked? The workers' claims are released.",
     displayName: "Nome visualizzato",
     displayNameHint: "(facoltativo)",
     description: "Descrizione",

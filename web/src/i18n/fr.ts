@@ -372,6 +372,13 @@ export const fr: Translations = {
     skillCount: "{count} compétence{s}",
     resultCount: "{count} résultat{s}",
     noDescription: "Aucune description disponible.",
+    sort: "Trier",
+    sortName: "Nom",
+    sortSize: "Plus volumineux",
+    sortCalls: "Plus appelées",
+    characters: "caractères",
+    calls: "appels",
+    callMetricHelp: "Les appels sont les chargements enregistrés de la compétence ; les vues et modifications sont exclues.",
     toolsets: "Ensembles d'outils",
     toolsetLabel: "Ensemble d'outils {name}",
     noToolsetsMatch: "Aucun ensemble d'outils ne correspond à la recherche.",
@@ -470,6 +477,8 @@ export const fr: Translations = {
     copyCliCommand: "Copier la commande CLI (pour externe / repli)",
     connect: "Connecter",
     sessionExpires: "La session expire dans {time}",
+    sessionExpiredNoError:
+      "La connexion a expiré sans atteindre le fournisseur. Cela signifie généralement que la page de connexion est restée bloquée dans l'onglet ouvert (problème côté serveur) — terminez la connexion là-bas, puis cliquez sur Réessayer. Si le problème persiste, utilisez une clé API ou la CLI à la place.",
     initiatingLogin: "Lancement du flux de connexion…",
     exchangingCode: "Échange du code contre des jetons…",
     connectedClosing: "Connecté ! Fermeture…",
@@ -618,6 +627,12 @@ export const fr: Translations = {
       "Les tableaux vous permettent de séparer des flux de travail indépendants — un par projet, dépôt ou domaine. Les workers d'un tableau ne voient jamais les tâches d'un autre.",
     slug: "Slug",
     slugHint: "— minuscules, tirets, par ex. atm10-server",
+    confirmDoneMany:
+      "Mark {n} tasks as done? The workers' claims are released and dependent children become ready.",
+    confirmArchiveMany:
+      "Archive {n} tasks? They disappear from the default board view.",
+    confirmBlockedMany:
+      "Mark {n} tasks as blocked? The workers' claims are released.",
     displayName: "Nom affiché",
     displayNameHint: "(facultatif)",
     description: "Description",
