@@ -238,6 +238,19 @@ class TestSkillViewDedup:
         assert _view(task="follow-up-task", session="shared").get("dedup") is not True
         assert _view(task="follow-up-task", session="shared")["dedup"] is True
 
+    def test_rotating_context_boundary_clears_parent_and_child_sessions(self, skills_home):
+        from agent.conversation_compression import _reset_read_dedup_caches
+
+        _view(task="parent-prior-task", session="parent-session")
+        _view(task="child-prior-task", session="child-session")
+        _reset_read_dedup_caches(
+            "current-task",
+            session_id="child-session",
+            previous_session_id="parent-session",
+        )
+        assert _view(task="parent-follow-up", session="parent-session").get("dedup") is not True
+        assert _view(task="child-follow-up", session="child-session").get("dedup") is not True
+
     def test_empty_session_id_preserves_legacy_global_reset(self, skills_home):
         _view(task="prior-task", session="shared")
         reset_skill_view_dedup(None, session_id="")
