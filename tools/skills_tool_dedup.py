@@ -1,5 +1,8 @@
 """Session-scoped, projection-aware skill content identity and repeat-view dedup.
-Cleared on compression so summarized-away skill content is served again.
+
+Cleared via ``reset_skill_view_dedup()`` on context compression and on a
+committed proactive tool-result prune, because both replace the original
+content with a one-line marker.
 """
 
 import copy
@@ -43,14 +46,31 @@ def _skill_view_identity(args, payload):
         "name": name,
         "source_identity": source_identity,
         "file_path": args.get("file_path"),
-                 "heading": args.get("heading"), "query": args.get("query"),
-                 "max_chars": max_chars, "children": children}
-    rid = hashlib.sha256(json.dumps(retrieval, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+        "heading": args.get("heading"),
+        "query": args.get("query"),
+        "max_chars": max_chars,
+        "children": children,
+    }
+    rid = hashlib.sha256(
+        json.dumps(
+            retrieval,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode()
+    ).hexdigest()
     visible = copy.deepcopy(payload)
     visible.pop("_source_path", None)
     visible.pop("content_hash", None)
     visible.pop("retrieval_id", None)
-    chash = hashlib.sha256(json.dumps(visible, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    chash = hashlib.sha256(
+        json.dumps(
+            visible,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode()
+    ).hexdigest()
     return rid, chash, retrieval
 
 
@@ -75,15 +95,24 @@ def _associate_skill_view_scope(task_id, scope):
                 aliases.discard(evicted_scope)
 
 
-def reset_skill_view_dedup(task_id: str | None = None) -> None:
+def reset_skill_view_dedup(
+    task_id: str | None = None,
+    *,
+    session_id: str | None = None,
+) -> None:
+    session_id = session_id or None
     with _skill_view_tracker_lock:
-        if task_id is None:
-            _skill_view_tracker.clear(); _skill_view_scope_tasks.clear()
+        if task_id is None and session_id is None:
+            _skill_view_tracker.clear()
+            _skill_view_scope_tasks.clear()
         else:
-            task_key = str(task_id)
-            scopes = _skill_view_scope_tasks.pop(task_key, set()) | {
-                "task:" + task_key
-            }
+            scopes = set()
+            if task_id is not None:
+                task_key = str(task_id)
+                scopes.update(_skill_view_scope_tasks.pop(task_key, set()))
+                scopes.add("task:" + task_key)
+            if session_id:
+                scopes.add("session:" + str(session_id))
             for scope in scopes:
                 _skill_view_tracker.pop(scope, None)
             for aliases in _skill_view_scope_tasks.values():
