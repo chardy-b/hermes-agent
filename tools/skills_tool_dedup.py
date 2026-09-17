@@ -100,6 +100,7 @@ def reset_skill_view_dedup(
     *,
     session_id: str | None = None,
 ) -> None:
+    session_id = session_id or None
     with _skill_view_tracker_lock:
         if task_id is None and session_id is None:
             _skill_view_tracker.clear()

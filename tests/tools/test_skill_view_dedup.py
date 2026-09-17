@@ -230,6 +230,26 @@ class TestSkillViewDedup:
         reset_skill_view_dedup("current-task", session_id="shared")
         assert _view(task="follow-up-task", session="shared").get("dedup") is not True
 
+    def test_context_boundary_helper_clears_prior_task_session_behaviorally(self, skills_home):
+        from agent.conversation_compression import _reset_read_dedup_caches
+
+        _view(task="prior-task", session="shared")
+        _reset_read_dedup_caches("current-task", session_id="shared")
+        assert _view(task="follow-up-task", session="shared").get("dedup") is not True
+        assert _view(task="follow-up-task", session="shared")["dedup"] is True
+
+    def test_empty_session_id_preserves_legacy_global_reset(self, skills_home):
+        _view(task="prior-task", session="shared")
+        reset_skill_view_dedup(None, session_id="")
+        assert _view(task="follow-up-task", session="shared").get("dedup") is not True
+
+    def test_session_only_reset_is_isolated(self, skills_home):
+        _view(task="task-a", session="session-a")
+        _view(task="task-b", session="session-b")
+        reset_skill_view_dedup(None, session_id="session-a")
+        assert _view(task="task-c", session="session-a").get("dedup") is not True
+        assert _view(task="task-d", session="session-b")["dedup"] is True
+
     def test_reset_all_and_compression_hook_seam(self, skills_home):
         _view()
         reset_skill_view_dedup()

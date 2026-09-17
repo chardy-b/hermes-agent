@@ -347,3 +347,19 @@ class TestCommittedPruneIsDedupBoundary:
         agent.context_compressor.prune_tool_results_only = lambda messages, current_tokens=None: (messages, 0)
         assert _run_tool_loop(agent, n_tool_iterations=1, task_id=task_id)["completed"] is True
         assert self._dedup_state(task_id) == (True, True)
+
+    def test_noop_prune_keeps_prior_task_session_scope(self, agent, tmp_path):
+        prior_task_id = "prior-task-noop"
+        current_task_id = "current-task-noop"
+        session_id = agent.session_id
+        self._seed_dedup(tmp_path, prior_task_id, session_id=session_id)
+        agent.context_compressor.prune_tool_results_only = (
+            lambda messages, current_tokens=None: (messages, 0)
+        )
+        assert (
+            _run_tool_loop(agent, n_tool_iterations=1, task_id=current_task_id)[
+                "completed"
+            ]
+            is True
+        )
+        assert self._dedup_state(prior_task_id, session_id=session_id)[0] is True
