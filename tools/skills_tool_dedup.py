@@ -1,5 +1,8 @@
 """Session-scoped, projection-aware skill content identity and repeat-view dedup.
-Cleared on compression so summarized-away skill content is served again.
+
+Cleared via ``reset_skill_view_dedup()`` on context compression and on a
+committed proactive tool-result prune, because both replace the original
+content with a one-line marker.
 """
 
 import copy

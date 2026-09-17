@@ -12,6 +12,40 @@ import contextlib
 from .method_ctx import bind_module
 
 
+@contextlib.contextmanager
+def _session_turn_admission(session: dict):
+    """Hold process admission until the history-locked running claim is visible to idle probes."""
+    from hermes_cli.backend_retirement import retirement
+
+    with retirement.work() as admitted, session["history_lock"]:
+        yield admitted
+
+
+def _start_session_work(target, *, name: str, session: dict | None = None):
+    """Reserve before spawning; release only after the worker (including cleanup) has unwound."""
+    from agent.memory_provider import spawn_context_thread
+    from hermes_cli.backend_retirement import retirement
+
+    if not retirement.acquire():
+        return None
+
+    def run():
+        try:
+            target()
+        finally:
+            retirement.release()
+
+    try:
+        thread = spawn_context_thread(run, name=name)
+        if session is not None:
+            session["_run_thread"] = thread
+        thread.start()
+        return thread
+    except BaseException:
+        retirement.release()
+        raise
+
+
 def _notify_session_boundary(event_type: str, session_id: str | None, platform: str | None = None) -> None:
     """Fire session lifecycle hooks with CLI parity."""
     with contextlib.suppress(Exception):
@@ -86,6 +120,22 @@ def _release_active_session_slot(session: dict | None) -> bool:
     if session.get("active_session_lease") is lease:
         session.pop("active_session_lease", None)
     return True
+
+
+def _release_hosted_room_turn_slot(session: dict) -> None:
+    """End-of-turn release for hosted room member sessions (``source=bot_room``) only.
+
+    A hosted room turn is serialized by the room driver's lease, not by this process, so the member
+    profile's ``bot_room`` slot is needed only while a turn is in flight. Holding it for the life of
+    the live session (which no reaper ever ends: room sessions have no client transport) locked every
+    other room worker sharing the home — messaging gateway + Desktop ``serve`` — out of that member
+    with ``Refused active session … already held by pid=…`` until this process exited (#106847).
+    Call under ``history_lock`` next to ``running = False`` so the next admission never observes the
+    stale lease and then runs lease-less; ``_admit_prompt_turn`` re-claims on the following turn.
+    """
+    from tui_gateway.hosted_room_driver import ROOM_SESSION_SOURCE
+    if _session_source(session) == ROOM_SESSION_SOURCE:
+        _release_active_session_slot(session)
 
 
 def _own_live_lease_ids(*, exclude=None) -> set[str]:
@@ -232,17 +282,22 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     if hasattr(agent, "_persist_session") and (snapshot := getattr(agent, "_session_messages", None)):
         with contextlib.suppress(Exception):
             agent._persist_session(snapshot)
-    # interrupted=True so crash-recovery plugins can flush state (mirrors cli.py atexit).
-    if agent is not None:
-        with contextlib.suppress(Exception):
-            from hermes_cli.lifecycle import invoke_hook
-            invoke_hook(
-                "on_session_end", completed=False, interrupted=True,
-                session_id=getattr(agent, "session_id", None) or session.get("session_key", ""),
-                model=getattr(agent, "model", "unknown"), platform=getattr(agent, "platform", None) or "tui")
-    if agent is not None and history and hasattr(agent, "commit_memory_session"):
-        with contextlib.suppress(Exception):
-            agent.commit_memory_session(history)
+    # interrupted=True so crash-recovery plugins can flush state (mirrors cli.py atexit). The end-of-session
+    # hooks and the memory commit read the provider's config/credentials at call time; every caller of this
+    # chokepoint is an unscoped reaper/Timer/atexit/pool thread, so bind the SESSION's profile here — unscoped
+    # they fail closed under multiplex (tail never committed) or, on the Desktop backend serving a named
+    # profile, commit a secondary's transcript to the launch profile's memory tenant (same class as #110622).
+    with _session_profile_runtime_scope(session):
+        if agent is not None:
+            with contextlib.suppress(Exception):
+                from hermes_cli.lifecycle import invoke_hook
+                invoke_hook(
+                    "on_session_end", completed=False, interrupted=True,
+                    session_id=getattr(agent, "session_id", None) or session.get("session_key", ""),
+                    model=getattr(agent, "model", "unknown"), platform=getattr(agent, "platform", None) or "tui")
+        if agent is not None and history and hasattr(agent, "commit_memory_session"):
+            with contextlib.suppress(Exception):
+                agent.commit_memory_session(history)
 
     session_key = session.get("session_key")
     session_id = getattr(agent, "session_id", None) or session_key
@@ -266,8 +321,15 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
                     # compression splits back to the reaped child, forever).
                     if _is_gateway_owned_source((db.get_session(session_id) or {}).get("source", "")):
                         _tui_owns_lifecycle = False
-                    elif _tui_owns_lifecycle:
+                    elif _tui_owns_lifecycle and not _desktop_automatic_cleanup:
+                        # Automatic Desktop cleanup (ws_orphan_reap, idle_timeout, etc.) reclaims
+                        # runtime but must not end the durable row — the conversation stays open
+                        # and resumable until the user explicitly closes or archives it.  #105588
                         db.end_session(session_id, end_reason)
+    # ``_teardown_session`` follows with ``agent.close()``, whose ``_finalize_owned_session_row`` ends the row as
+    # ``agent_close`` through the agent's own handle — every spare decision above would be undone one call later.
+    if agent is not None and (_desktop_automatic_cleanup or not _tui_owns_lifecycle):
+        agent._end_session_on_close = False
     # In-flight async delegations end WITH the session (no return address left). Always interrupt by THIS live UI
     # sid; by durable session_key only when the TUI owns the lifecycle — a viewer tab must not kill gateway work.
     with contextlib.suppress(Exception):
@@ -311,7 +373,9 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
         from tools.approval import unregister_gateway_notify
         if key := session.get("session_key"):
             unregister_gateway_notify(key)
-    with contextlib.suppress(Exception):
+    # agent.close() → shutdown_memory_provider reads the provider's config/credentials at call time; same
+    # scope rule as _finalize_session (every caller here is an unscoped reaper/atexit/pool thread).
+    with contextlib.suppress(Exception), _session_profile_runtime_scope(session):
         if hasattr(agent := session.get("agent"), "close"):
             agent.close()
 
@@ -405,6 +469,18 @@ def _interrupt_session_turn(sid: str, session: dict, *, request_id: str | None =
         session["queued_prompt"] = None
         session.pop("queued_prompts", None)
         session["_queued_prompt_generation"] = int(session.get("_queued_prompt_generation", 0)) + 1
+    if should_interrupt:
+        # Sibling of gateway/run_agent_cache.py::_interrupt_and_clear_session: a user-initiated stop of a
+        # live TUI/desktop turn is the same "loop is gone" event for plugins holding per-turn external
+        # resources. Observer-only; dispatch failures never break the interrupt.
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "agent_loop_stopped", session_key=session.get("session_key", ""), platform="tui",
+                reason="user_stop", invalidation_reason="session_interrupt",
+            )
+        except Exception:
+            logger.debug("agent_loop_stopped hook dispatch failed", exc_info=True)
     if not use_compute_host:
         if should_interrupt:
             from agent.interrupt_compat import request_hard_interrupt
@@ -438,8 +514,9 @@ def _session_has_active_delegations(sid: str, session: dict | None = None) -> bo
     if session_id:
         # Only when this session may end its durable row by key — never for gateway-originated sessions (TUI is a
         # viewer there). Unknown DB state -> assume ownership.
-        with contextlib.suppress(Exception):
-            db = _get_db()
+        # The row lives in the session's OWN store (a named-profile session's row is invisible to
+        # the launch handle, which would leave this guard permanently dead).
+        with contextlib.suppress(Exception), _session_db(session) as db:
             if db is not None and _is_gateway_owned_source((db.get_session(session_id) or {}).get("source", "")):
                 owned_session_key = ""
     if not own_sid and not owned_session_key:
