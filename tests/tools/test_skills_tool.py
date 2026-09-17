@@ -1031,6 +1031,7 @@ class TestSkillViewCollisionDetection:
         assert "Ambiguous" in result["error"]
         assert len(result["matches"]) == 2
 
+
 class TestProgressiveSkillView:
     def test_legacy_view_remains_full_and_projection_filters_links(self, tmp_path):
         skill_dir = _make_skill(
@@ -1184,6 +1185,8 @@ class TestProgressiveSkillView:
         assert missing["error_code"] == "composition_missing_child"
         assert undeclared["success"] is False
         assert undeclared["error_code"] == "composition_child_not_declared"
+
+
 class TestSameRootDuplicationResolves:
     """Copies of ONE skill inside ONE search dir are not shadowing (#112179): a symlink-view root
     legitimately carries ``<root>/name`` and ``<root>/cat/name`` with identical content; the

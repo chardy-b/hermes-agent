@@ -3097,7 +3097,7 @@ def _reset_read_dedup_caches(task_id: str, *, session_id: str = "", skills: bool
         return
     with contextlib.suppress(Exception):
         from tools.skills_tool import reset_skill_view_dedup
-        reset_skill_view_dedup(task_id)
+        reset_skill_view_dedup(task_id, session_id=session_id)
 
 
 def _finish_compaction_boundary(

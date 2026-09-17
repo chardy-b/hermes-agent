@@ -225,6 +225,11 @@ class TestSkillViewDedup:
         reset_skill_view_dedup("task-b")
         assert _view(task="task-a", session="shared").get("dedup") is not True
 
+    def test_explicit_session_reset_clears_scope_before_new_task_records(self, skills_home):
+        _view(task="prior-task", session="shared")
+        reset_skill_view_dedup("current-task", session_id="shared")
+        assert _view(task="follow-up-task", session="shared").get("dedup") is not True
+
     def test_reset_all_and_compression_hook_seam(self, skills_home):
         _view()
         reset_skill_view_dedup()

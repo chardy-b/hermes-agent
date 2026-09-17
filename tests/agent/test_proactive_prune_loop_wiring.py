@@ -266,7 +266,7 @@ class TestCommittedPruneIsDedupBoundary:
     or the reload the marker asks for is refused (#112763)."""
 
     @staticmethod
-    def _seed_dedup(tmp_path, task_id):
+    def _seed_dedup(tmp_path, task_id, session_id=None):
         from tools.file_tools_read_tracking import _read_tracker, _read_tracker_lock, _task_data
         from tools.skills_tool_dedup import (
             _skill_view_check_or_record,
@@ -282,7 +282,7 @@ class TestCommittedPruneIsDedupBoundary:
         payload = {"name": "bigskill", "content": "# s\n", "_source_path": str(skill_md)}
         retrieval_id, content_hash, retrieval = _skill_view_identity(args, payload)
         assert _skill_view_check_or_record(
-            _skill_view_scope(task_id, None),
+            _skill_view_scope(task_id, session_id),
             task_id,
             retrieval_id,
             content_hash,
@@ -297,11 +297,12 @@ class TestCommittedPruneIsDedupBoundary:
         return skill_md
 
     @staticmethod
-    def _dedup_state(task_id):
+    def _dedup_state(task_id, session_id=None):
         from tools.file_tools_read_tracking import _read_tracker
         from tools.skills_tool_dedup import _skill_view_tracker
 
-        skill_stubbed = bool(_skill_view_tracker.get("task:" + task_id))
+        scope = "session:" + session_id if session_id else "task:" + task_id
+        skill_stubbed = bool(_skill_view_tracker.get(scope))
         file_in_generation = ("/x/big.txt", 1, 2000) in _read_tracker[task_id]["dedup_generation_reads"]
         return skill_stubbed, file_in_generation
 
@@ -324,6 +325,21 @@ class TestCommittedPruneIsDedupBoundary:
         # Skill: next view serves full content again. File: the generation-read set is cleared so the
         # first unchanged re-read serves content; the mtime map itself is preserved (later reads stub).
         assert self._dedup_state(task_id) == (False, False)
+
+    def test_committed_prune_releases_prior_task_session_scope(self, agent, tmp_path):
+        prior_task_id = "prior-task"
+        current_task_id = "current-task"
+        session_id = agent.session_id
+        self._seed_dedup(tmp_path, prior_task_id, session_id=session_id)
+        assert self._dedup_state(prior_task_id, session_id=session_id)[0] is True
+
+        def _prune(messages, current_tokens=None):
+            pruned = [dict(m) for m in messages]
+            return pruned, 1
+
+        agent.context_compressor.prune_tool_results_only = _prune
+        assert _run_tool_loop(agent, n_tool_iterations=1, task_id=current_task_id)["completed"] is True
+        assert self._dedup_state(prior_task_id, session_id=session_id)[0] is False
 
     def test_noop_prune_keeps_dedup(self, agent, tmp_path):
         task_id = "prune-noop-task"
