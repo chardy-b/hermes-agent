@@ -42,6 +42,8 @@ def skills_home(tmp_path, monkeypatch):
     )
     monkeypatch.setenv("HERMES_HOME", str(home))
     reset_skill_view_dedup()
+    from tools.skill_manager_guards import _reset_background_review_read_marks
+    _reset_background_review_read_marks()
     return home
 
 
