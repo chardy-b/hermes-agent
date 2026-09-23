@@ -42,6 +42,8 @@ def skills_home(tmp_path, monkeypatch):
     )
     monkeypatch.setenv("HERMES_HOME", str(home))
     reset_skill_view_dedup()
+    from tools.skill_manager_guards import _reset_background_review_read_marks
+    _reset_background_review_read_marks()
     return home
 
 
@@ -218,6 +220,49 @@ class TestSkillViewDedup:
         assert first_id != second_id
         assert first_projection["source_identity"] != second_projection["source_identity"]
         assert "/one/" not in json.dumps(first_projection)
+
+    def test_background_review_skips_dedup_and_marks_read(self, skills_home):
+        from tools.skill_provenance import (
+            reset_current_write_origin,
+            set_current_write_origin,
+        )
+
+        _view()
+
+        token = set_current_write_origin("background_review")
+        try:
+            review = _view()
+        finally:
+            reset_current_write_origin(token)
+
+        assert review["success"] is True
+        assert "Alpha procedure" in review.get("content", "")
+        assert review.get("dedup") is None
+        assert review.get("content_returned") is None
+
+        from tools.skill_manager_guards import _background_review_has_read
+
+        skill_path = skills_home / "skills" / "demo-dedup-skill" / "SKILL.md"
+        assert _background_review_has_read(skill_path)
+
+    def test_background_review_does_not_pollute_foreground_cache(self, skills_home):
+        from tools.skill_provenance import (
+            reset_current_write_origin,
+            set_current_write_origin,
+        )
+
+        token = set_current_write_origin("background_review")
+        try:
+            _view()
+        finally:
+            reset_current_write_origin(token)
+
+        foreground = _view()
+        assert "Alpha procedure" in foreground.get("content", "")
+
+        repeat = _view()
+        assert repeat.get("dedup") is True
+        assert repeat.get("content_returned") is False
 
     def test_task_reset_clears_every_associated_session(self, skills_home):
         _view(task="task-a", session="shared")

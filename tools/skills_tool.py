@@ -28,6 +28,7 @@ from tools.skills_tool_plugin import (  # noqa: F401
     _serve_plugin_skill, _serve_skill_file, _truncate_description)
 from tools.skills_tool_dedup import (  # noqa: F401
     _skill_view_identity, _skill_view_scope, _skill_view_check_or_record, reset_skill_view_dedup)
+from tools.skill_provenance import is_background_review
 
 logger = logging.getLogger(__name__)
 
@@ -917,14 +918,8 @@ def _skill_view_with_bump(args, **kw):
         return json.dumps(parsed, ensure_ascii=False)
 
     scope = _skill_view_scope(task_id, kw.get("session_id"))
-    stub = _skill_view_check_or_record(
-        scope,
-        task_id,
-        retrieval_id,
-        content_hash,
-        parsed,
-        retrieval,
-    )
+    stub = None if is_background_review() else _skill_view_check_or_record(
+        scope, task_id, retrieval_id, content_hash, parsed, retrieval)
     if stub is not None:
         return stub
     resolved = parsed.get("name") or name
