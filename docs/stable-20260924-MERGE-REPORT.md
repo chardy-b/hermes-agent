@@ -21,3 +21,7 @@ Curator audits; progressive/composed retrieval and topology; prominent roots; co
 Only the reviewed source, regression, workflow, and report files were edited. No local package installs, tests, builds, credentials, pushes, or commits were used; lightweight syntax checks were run only. Actual tests remain pending and no CI result is being claimed.
 
 Independent exact-tree review and GitHub CI remain mandatory before deployment. A focused workflow checks both candidate and exact stable parent with locked dependencies and the repository test runner. Full PR CI covers broader regressions/builds. No deployment has occurred.
+
+## Lock provenance
+
+The canonical `uv.lock` was produced by GitHub Actions run `#37712275782` on branch `maintenance/stable-20260924-lock` using `uv 0.12.13` and the merged `pyproject.toml`. Artifact `stable-canonical-lock` (ID 11522177676, SHA-256 `67064640...b9ebf84`) was downloaded through a Keyholder github-readonly grant, verified against its published digest, and the contents matched the candidate manifest byte-for-byte. Transitive packages `aiohttp`/`aiohttp-retry`/`pydantic`/`python-dateutil`/`typing-extensions`/`urllib3` for `hindsight-client` are present. Blob OID: `6096bca6d5396e19be3fdef68eb07648d83323af`. See `docs/stable-review-followup.json` for full review output and lock-provenance proof.
