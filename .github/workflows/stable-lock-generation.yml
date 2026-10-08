@@ -1,0 +1,31 @@
+name: Generate stable integration lock
+on:
+  push:
+    branches: [maintenance/stable-20260924-lock]
+permissions:
+  contents: read
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: '0.12.13'
+      - name: Generate canonical lock for reviewed manifest
+        run: |
+          set -euo pipefail
+          printf '%s\n' '233926e904763d93178584dfd7be544aa20297ad4ab1a0f59695e6f811adb5f1  docs/stable-lock-input.toml' | sha256sum -c -
+          cp docs/stable-lock-input.toml pyproject.toml
+          uv lock --python 3.11
+          uv lock --check
+          mkdir -p lock-evidence
+          cp pyproject.toml uv.lock lock-evidence/
+          sha256sum pyproject.toml uv.lock > lock-evidence/SHA256SUMS
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stable-canonical-lock
+          path: lock-evidence/
+          if-no-files-found: error
+          retention-days: 14
