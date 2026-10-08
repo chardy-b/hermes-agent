@@ -373,4 +373,4 @@ jobs:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
-          HERMES_E2E_UPGRADE_BASE: ${{ github.event_name == 'pull_request' && github.head_ref == 'sync-stable-20260924' && '8b9a5ebd34c4e771832f9ca57e4b863c107d25d2' || '' }}
+          HERMES_E2E_UPGRADE_BASE: ${{ github.event_name == 'pull_request' && github.head_ref == 'sync-stable-20260924' && github.event.pull_request.number == 17 && github.event.pull_request.head.repo.full_name == github.repository && '8b9a5ebd34c4e771832f9ca57e4b863c107d25d2' || '' }}
