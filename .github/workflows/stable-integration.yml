@@ -22,10 +22,16 @@ jobs:
           version: '0.12.13'
           enable-cache: true
       - name: Install locked test environment
-        run: uv sync --locked --python 3.11 --extra dev --extra messaging
+        run: uv sync --locked --python 3.11 --extra dev --extra messaging --extra hindsight
       - name: Verify exact revision and lock
+        env:
+          EXPECTED_SHA: ${{ matrix.source == 'stable' && 'f97608f178d1ffeca59860195ab7da295f7c8e5f' || github.sha }}
         run: |
-          git rev-parse HEAD
+          set -euo pipefail
+          actual_sha="$(git rev-parse HEAD)"
+          printf 'Expected revision: %s\n' "$EXPECTED_SHA"
+          printf 'Checked out revision: %s\n' "$actual_sha"
+          test "$actual_sha" = "$EXPECTED_SHA"
           uv lock --check
       - name: Focused retained-feature regressions
         env:
