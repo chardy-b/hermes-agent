@@ -345,6 +345,116 @@ class TestBuildSkillsSystemPrompt:
         second = build_skills_system_prompt()
         assert "cached-skill" not in second
 
+    def test_v3_snapshot_without_requires_apps_is_rebuilt_and_gated(self, monkeypatch, tmp_path):
+        import json
+        from agent import prompt_builder as pb
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skills_dir = tmp_path / "skills" / "tools"
+        skill_dir = skills_dir / "calendar"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: calendar\ndescription: Calendar integration\nrequires_apps: [calendar]\n---\n",
+            encoding="utf-8",
+        )
+
+        snapshot = {
+            "version": 3,
+            "manifest": pb._build_skills_manifest(skills_dir),
+            "skills": [{
+                "skill_name": "calendar",
+                "frontmatter_name": "calendar",
+                "description": "Calendar integration",
+                "platforms": [],
+                "conditions": {},
+            }],
+            "category_descriptions": {},
+        }
+        assert "requires_apps" not in snapshot["skills"][0]
+        pb._skills_prompt_snapshot_path().write_text(json.dumps(snapshot), encoding="utf-8")
+        monkeypatch.setattr(pb, "skill_matches_apps", lambda frontmatter: not frontmatter.get("requires_apps"))
+
+        result = build_skills_system_prompt()
+
+        assert "calendar" not in result
+        rebuilt = json.loads(pb._skills_prompt_snapshot_path().read_text(encoding="utf-8"))
+        assert rebuilt["version"] == 4
+        assert rebuilt["skills"][0]["requires_apps"] == ["calendar"]
+
+    def test_profile_snapshot_identity_prevents_cross_home_cache_reuse(self, monkeypatch, tmp_path):
+        import json
+        from agent import prompt_builder as pb
+
+        home_a = tmp_path / "profile-a"
+        home_b = tmp_path / "profile-b"
+        skills_dir = tmp_path / "shared-skills" / "tools"
+        skill_dir = skills_dir / "shared"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: shared\ndescription: Shared skill\n---\n", encoding="utf-8"
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(home_a))
+        first = pb._build_skills_system_prompt_inner(skills_dir, [], None, None, None)
+        snapshot_a = json.loads((home_a / ".skills_prompt_snapshot.json").read_text(encoding="utf-8"))
+        snapshot_a["skills"][0]["description"] = "Profile A skill"
+        (home_a / ".skills_prompt_snapshot.json").write_text(json.dumps(snapshot_a), encoding="utf-8")
+
+        monkeypatch.setenv("HERMES_HOME", str(home_b))
+        snapshot_b = dict(snapshot_a)
+        snapshot_b["skills"] = [dict(snapshot_a["skills"][0], description="Profile B skill")]
+        home_b.mkdir(parents=True)
+        (home_b / ".skills_prompt_snapshot.json").write_text(json.dumps(snapshot_b), encoding="utf-8")
+        second = pb._build_skills_system_prompt_inner(skills_dir, [], None, None, None)
+
+        assert first != second
+        assert "Profile B skill" in second
+
+    def test_app_availability_change_rebuilds_cached_snapshot(self, monkeypatch, tmp_path):
+        from agent import prompt_builder as pb
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skills_dir = tmp_path / "skills" / "tools"
+        skill_dir = skills_dir / "calendar"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: calendar\ndescription: Calendar integration\nrequires_apps: [calendar]\n---\n",
+            encoding="utf-8",
+        )
+        available = {"value": True}
+        monkeypatch.setattr(pb, "skill_matches_apps", lambda frontmatter: available["value"])
+
+        first = build_skills_system_prompt()
+        available["value"] = False
+        second = build_skills_system_prompt()
+
+        assert "calendar" in first
+        assert "calendar" not in second
+
+    def test_prominent_root_config_change_rebuilds_cached_prompt(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skills_dir = tmp_path / "skills" / "tools"
+        for name in ("alpha", "beta"):
+            skill_dir = skills_dir / name
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: {name.title()} root\n"
+                "skill_role: root\nroot_eligible: true\n---\n",
+                encoding="utf-8",
+            )
+        (tmp_path / "config.yaml").write_text(
+            "skills:\n  prominent_roots: [alpha]\n  root_catalog_limit: 1\n", encoding="utf-8"
+        )
+
+        first = build_skills_system_prompt()
+        (tmp_path / "config.yaml").write_text(
+            "skills:\n  prominent_roots: [beta]\n  root_catalog_limit: 1\n", encoding="utf-8"
+        )
+        second = build_skills_system_prompt()
+
+        assert "- alpha: Alpha root" in first
+        assert "- beta: Beta root" in second
+
     def test_prominent_roots_follow_project_precedence_and_external_visibility(self, monkeypatch, tmp_path):
         from agent import prompt_builder as pb
 

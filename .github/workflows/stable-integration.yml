@@ -31,10 +31,56 @@ jobs:
         env:
           HERMES_TEST_WORKERS: '2'
           HERMES_TEST_FILE_RETRIES: '0'
+          MATRIX_SOURCE: ${{ matrix.source }}
         run: |
           set -euo pipefail
           source .venv/bin/activate
-          mapfile -t files < <(python -c 'import pathlib; patterns=["tests/agent/test_skill_reviewer.py","tests/hermes_cli/test_curator_review.py","tests/agent/test_skill_composition.py","tests/agent/test_skill_topology.py","tests/agent/test_prompt_builder.py","tests/agent/test_proactive_prune_loop_wiring.py","tests/tools/test_skill_view*.py","tests/tools/test_plugin_skills.py","tests/tools/test_skills_tool.py","tests/hermes_cli/test_codex_models.py","tests/hermes_cli/test_gpt6_tiers_registration.py","tests/agent/test_model_metadata*.py","tests/agent/test_reasoning_effort*.py","tests/gateway/test_companion_api.py","tests/test_pairing_invitations.py","tests/hermes_cli/test_web_server_skills_profiles.py"]; print("\n".join(sorted({str(p) for pattern in patterns for p in pathlib.Path().glob(pattern) if p.is_file()})))')
+          mapfile -t files < <(python - <<'PY'
+          import os
+          import pathlib
+          import sys
+
+          patterns = [
+              "tests/agent/test_skill_reviewer.py",
+              "tests/hermes_cli/test_curator_review.py",
+              "tests/agent/test_skill_composition.py",
+              "tests/agent/test_skill_topology.py",
+              "tests/agent/test_prompt_builder.py",
+              "tests/agent/test_proactive_prune_loop_wiring.py",
+              "tests/tools/test_skill_view*.py",
+              "tests/tools/test_plugin_skills.py",
+              "tests/tools/test_skills_tool.py",
+              "tests/hermes_cli/test_codex_models.py",
+              "tests/hermes_cli/test_gpt6_tiers_registration.py",
+              "tests/agent/test_model_metadata*.py",
+              "tests/agent/test_reasoning_effort*.py",
+              "tests/gateway/test_companion_api.py",
+              "tests/test_pairing_invitations.py",
+              "tests/hermes_cli/test_web_server_skills_profiles.py",
+          ]
+          strict = os.environ["MATRIX_SOURCE"] == "candidate"
+          files = set()
+          missing = []
+          for pattern in patterns:
+              has_glob = any(char in pattern for char in "*?[")
+              matches = ([path for path in pathlib.Path().glob(pattern) if path.is_file()]
+                         if has_glob else ([pathlib.Path(pattern)] if pathlib.Path(pattern).is_file() else []))
+              if not matches:
+                  missing.append(pattern)
+              files.update(str(path) for path in matches)
+          if strict and missing:
+              print("Missing required candidate test paths/globs:", *missing, sep="\n", file=sys.stderr)
+              raise SystemExit(1)
+          print("\n".join(sorted(files)))
+          PY
+          )
           printf '%s\n' "${files[@]}"
           test "${#files[@]}" -gt 0
           scripts/run_tests.sh "${files[@]}" 2>&1 | tee focused-tests.log
+      - name: Upload focused test log
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: focused-tests-${{ matrix.source }}-${{ github.run_id }}
+          path: focused-tests.log
+          if-no-files-found: warn

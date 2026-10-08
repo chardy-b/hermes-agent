@@ -10,7 +10,7 @@ Thirteen paths conflicted. GPT-6/Codex backports (`47ac95b`, `a50cb32`) overlap 
 
 Progressive retrieval (`a5fea82`), prominent roots (`4c0f31a`), usage sorting (`2368a96`), and dedup fixes (`063b723`, `b19a81c`, `eaa2174`, plus `df8da70` coverage) overlap skill/plugin/prompt changes. Combine topology with application gating; preserve projection-aware session/task dedup and all compatible tests. Eight test methods omitted by the first candidate were restored before review.
 
-Companion durability (`4d80e3e`) and CI adaptation (`232711d`) overlap dependency metadata. Retain companion PyJWT and jsonschema test tooling; union and deduplicate lock exclusions without fabricating package records.
+Companion durability (`4d80e3e`) and CI adaptation (`232711d`) overlap dependency metadata. Retain companion PyJWT and jsonschema test tooling. The canonical `uv.lock` was generated and checked by GitHub Actions run `37712275782` and is already integrated; it was not edited here.
 
 ## Preserved custom features
 
@@ -18,6 +18,6 @@ Curator audits; progressive/composed retrieval and topology; prominent roots; co
 
 ## Validation gates
 
-Local work used tool-free Codex OAuth patch generation because native sandbox namespaces are blocked. Only isolated-clone file edits were applied. Syntax/JSON/TOML checks and test-name preservation passed; no local package installs, tests or builds ran.
+Only the reviewed source, regression, workflow, and report files were edited. No local package installs, tests, builds, credentials, pushes, or commits were used; lightweight syntax checks were run only. Actual tests remain pending and no CI result is being claimed.
 
 Independent exact-tree review and GitHub CI remain mandatory before deployment. A focused workflow checks both candidate and exact stable parent with locked dependencies and the repository test runner. Full PR CI covers broader regressions/builds. No deployment has occurred.

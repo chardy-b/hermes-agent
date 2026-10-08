@@ -16,7 +16,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from hermes_constants import (
-    get_hermes_home, get_scratch_dir, get_skills_dir, is_wsl, reset_hermes_home_override, set_hermes_home_override,
+    get_hermes_home, get_scratch_dir, get_skills_dir, hermes_home_key, is_wsl, reset_hermes_home_override,
+    set_hermes_home_override,
 )
 
 from agent.skill_topology import normalize_skill_topology
@@ -1119,8 +1120,8 @@ def drain_truncation_warnings() -> list:
 _SKILLS_PROMPT_CACHE_MAX = 32
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
-# v2 added org provenance fields (org_id/org_author); older snapshots are rebuilt.
-_SKILLS_SNAPSHOT_VERSION = 3  # topology metadata added to snapshots
+# v4 snapshots include org provenance, root topology, and requires_apps; older schemas are rebuilt.
+_SKILLS_SNAPSHOT_VERSION = 4
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1422,21 +1423,33 @@ def _build_skills_system_prompt_inner(
     disabled = get_disabled_skill_names(_platform_hint or None)
     prominent_roots, root_catalog_limit = get_prominent_roots_config()
     project_dirs = project_dirs or []
+    snapshot = _load_skills_snapshot(skills_dir)
+    # Profile/home, app availability, and prominent-root configuration all affect the rendered prompt.
+    # A missing snapshot deliberately disables cache reads: app-gated skills may have changed while the
+    # snapshot was unavailable, and the subsequent scan must rebuild the gating decision.
+    app_availability = None if snapshot is None else tuple(
+        (
+            str(entry.get("frontmatter_name") or entry.get("skill_name") or ""),
+            bool(skill_matches_apps({"requires_apps": entry.get("requires_apps") or []})),
+        )
+        for entry in snapshot.get("skills", [])
+        if isinstance(entry, dict)
+    )
     cache_key = (
-        str(skills_dir), tuple(str(d) for d in external_dirs), tuple(str(d) for d in project_dirs),
+        hermes_home_key(), str(skills_dir), tuple(str(d) for d in external_dirs),
+        tuple(str(d) for d in project_dirs),
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint, tuple(sorted(disabled)), tuple(sorted(compact_categories or ())),
-        prominent_roots, root_catalog_limit,
+        prominent_roots, root_catalog_limit, app_availability,
         _oneshot_prompt_variant(),
     )
-    snapshot = _load_skills_snapshot(skills_dir)
     app_gated = snapshot is not None and any(
         entry.get("requires_apps") for entry in snapshot.get("skills", []) if isinstance(entry, dict)
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
-        if cached is not None and not app_gated:
+        if cached is not None and app_availability is not None and not app_gated:
             _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
             return cached
 
