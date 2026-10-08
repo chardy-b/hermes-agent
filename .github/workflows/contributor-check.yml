@@ -27,8 +27,23 @@ jobs:
           # Get the merge base between this PR and main
           MERGE_BASE=$(git merge-base origin/main HEAD)
 
-          # Find any new author emails in this PR's commits
-          NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
+          # A history-preserving stable sync imports upstream's already-authored
+          # commits.  Exclude that ancestry only when the pinned stable commit
+          # and its exact update merge are both proven to be in this history.
+          TRUSTED_STABLE_SHA=f97608f178d1ffeca59860195ab7da295f7c8e5f
+          TRUSTED_SYNC_MERGE_SHA=fd3bfb8af2da656f272f9a4a5f1319364d5ee08c
+          if git merge-base --is-ancestor "$TRUSTED_STABLE_SHA" HEAD \
+            && git merge-base --is-ancestor "$TRUSTED_SYNC_MERGE_SHA" HEAD \
+            && [ "$(git rev-parse "${TRUSTED_SYNC_MERGE_SHA}^2" 2>/dev/null)" = "$TRUSTED_STABLE_SHA" ]; then
+            # Find new author emails, excluding only commits reachable from the
+            # verified stable parent.  Fork-only commits remain in the range.
+            NEW_EMAILS=$(git log "${MERGE_BASE}..HEAD" --format='%ae' --no-merges \
+              --not "$TRUSTED_STABLE_SHA" | sort -u)
+          else
+            # Fail closed: an unverified or unrelated history gets the default
+            # attribution check with no upstream exemption.
+            NEW_EMAILS=$(git log "${MERGE_BASE}..HEAD" --format='%ae' --no-merges | sort -u)
+          fi
 
           if [ -z "$NEW_EMAILS" ]; then
             echo "No new commits to check."

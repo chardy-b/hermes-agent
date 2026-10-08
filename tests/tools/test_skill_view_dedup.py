@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
@@ -51,7 +52,7 @@ def _view(
     name="demo-dedup-skill",
     *,
     task="task-a",
-    session=None,
+    session="session-a",
     **projection,
 ):
     args = {"name": name, **projection}
@@ -67,6 +68,12 @@ def _is_hash(value):
 
 
 class TestSkillViewDedup:
+    def test_first_view_returns_full_content(self, skills_home):
+        r = _view("demo-dedup-skill")
+        assert r["success"] is True
+        assert "Alpha procedure" in r.get("content", "")
+
+
     def test_first_full_view_has_stable_public_hashes_and_repeat_is_stub(self, skills_home):
         first = _view()
         second = _view()
@@ -80,6 +87,16 @@ class TestSkillViewDedup:
         assert second["content_hash"] == first["content_hash"]
         assert "content" not in second
 
+    def test_modified_skill_returns_full_content(self, skills_home):
+        _view("demo-dedup-skill")
+        md = skills_home / "skills" / "demo-dedup-skill" / "SKILL.md"
+        time.sleep(0.01)
+        md.write_text(md.read_text(encoding="utf-8") + "\nStep two: new instruction.\n", encoding="utf-8")
+        r2 = _view("demo-dedup-skill")
+        assert "Step two" in r2.get("content", "")
+        assert r2.get("dedup") is None
+
+
     def test_projection_repeat_dedups_but_different_heading_does_not(self, skills_home):
         alpha = _view(heading="Alpha")
         alpha_again = _view(heading="Alpha")
@@ -88,6 +105,13 @@ class TestSkillViewDedup:
         assert "Beta procedure" in beta["content"]
         assert beta.get("dedup") is not True
         assert alpha["retrieval_id"] != beta["retrieval_id"]
+    def test_repeat_view_returns_stub(self, skills_home):
+        _view("demo-dedup-skill")
+        r2 = _view("demo-dedup-skill")
+        assert r2["success"] is True
+        assert r2.get("dedup") is True
+        assert r2.get("content_returned") is False
+        assert "content" not in r2
 
     def test_omitted_and_explicit_default_projection_budget_are_equivalent(self, skills_home):
         first = _view(heading="Alpha")
@@ -122,12 +146,25 @@ class TestSkillViewDedup:
         assert isolated.get("dedup") is not True
         assert first["retrieval_id"] == isolated["retrieval_id"]
 
+    def test_different_tasks_do_not_share_cache(self, skills_home):
+        _view("demo-dedup-skill", task="task-A", session=None)
+        r = _view("demo-dedup-skill", task="task-B", session=None)
+        assert "Alpha procedure" in r.get("content", "")
+
+
+    def test_no_task_id_never_dedups(self, skills_home):
+        args = {"name": "demo-dedup-skill"}
+        r1 = json.loads(_skill_view_with_bump(args, task_id=None))
+        r2 = json.loads(_skill_view_with_bump(args, task_id=None))
+        assert "Alpha procedure" in r2.get("content", "")
+
+
     def test_task_scope_is_fallback_and_no_scope_never_dedups(self, skills_home):
-        _view(task="task-a")
-        assert _view(task="task-a")["dedup"] is True
-        assert _view(task="task-b").get("dedup") is not True
-        first = _view(task=None)
-        second = _view(task=None)
+        _view(task="task-a", session=None)
+        assert _view(task="task-a", session=None)["dedup"] is True
+        assert _view(task="task-b", session=None).get("dedup") is not True
+        first = _view(task=None, session=None)
+        second = _view(task=None, session=None)
         assert first.get("dedup") is not True
         assert second.get("dedup") is not True
         assert "content_hash" in first
@@ -264,6 +301,13 @@ class TestSkillViewDedup:
         assert repeat.get("dedup") is True
         assert repeat.get("content_returned") is False
 
+    def test_reset_returns_full_content(self, skills_home):
+        _view("demo-dedup-skill")
+        reset_skill_view_dedup("task-a")
+        r2 = _view("demo-dedup-skill")
+        assert "Alpha procedure" in r2.get("content", "")
+
+
     def test_task_reset_clears_every_associated_session(self, skills_home):
         _view(task="task-a", session="shared")
         assert _view(task="task-b", session="shared")["dedup"] is True
@@ -334,6 +378,16 @@ class TestSkillViewDedup:
         assert {result["content_hash"] for result in results} == {
             results[0]["content_hash"]
         }
+
+    def test_linked_file_dedup_is_independent(self, skills_home):
+        _view("demo-dedup-skill")
+        # First view of a DIFFERENT file within the skill: full content.
+        r = _view("demo-dedup-skill", file_path="references/guide.md")
+        assert "Detailed reference" in r.get("content", "")
+        # Repeat of that file: stub.
+        r2 = _view("demo-dedup-skill", file_path="references/guide.md")
+        assert r2.get("dedup") is True
+
 
     def test_linked_file_identity_is_independent(self, skills_home):
         _view()

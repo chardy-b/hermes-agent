@@ -24,11 +24,11 @@ from hermes_cli.codex_models import _finalize_codex_models
 from hermes_cli.model_switch import _model_sort_key
 from hermes_cli.models import OPENROUTER_MODELS, _PROVIDER_MODELS
 
-GPT6_TIERS = ("gpt-6-sol", "gpt-6-terra", "gpt-6-luna")
+GPT6_TIERS = ("gpt-6-sol", "gpt-6-luna")
 
 
 def test_model_gpt_resolves_flagship_across_gpt6_tiers():
-    models = ["gpt-6-luna", "gpt-5.6-sol", "gpt-6-terra", "gpt-6-sol", "gpt-6-astra"]
+    models = ["gpt-6-luna", "gpt-5.6-sol", "gpt-6-sol", "gpt-6-astra"]
     models.sort(key=lambda m: _model_sort_key(m, "gpt"))
     assert models[:2] == ["gpt-6-astra", "gpt-6-sol"]
     assert models.index("gpt-6-luna") < models.index("gpt-5.6-sol")
@@ -52,7 +52,7 @@ def test_gpt6_tiers_replace_56_in_aggregator_catalogs_with_pricing_aliases():
     for provider, listed in (("nous", set(_PROVIDER_MODELS["nous"])), ("openrouter", {m for m, _ in OPENROUTER_MODELS})):
         assert {f"openai/{t}" for t in GPT6_TIERS} <= listed, provider
         assert not {m for m in listed if "gpt-5.6" in m}, provider
-    for base in ("gpt-6-sol", "gpt-6-luna"):  # Terra has no published pricing page yet
+    for base in GPT6_TIERS:
         entry = _OFFICIAL_DOCS_PRICING[("openai", base)]
         assert entry.input_cost_per_million is not None, base
         assert entry.cache_write_cost_per_million == entry.input_cost_per_million * Decimal("1.25"), base
