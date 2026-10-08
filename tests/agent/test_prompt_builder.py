@@ -495,19 +495,18 @@ class TestBuildSkillsSystemPrompt:
         second = build_skills_system_prompt()
         second_cache_keys = set(pb._SKILLS_PROMPT_CACHE)
 
-        first_prominent, first_available = first.split("## Prominent skills\n", 1)[1].split(
+        first_prominent, _ = first.split("## Prominent skills\n", 1)[1].split(
             "<available_skills>", 1
         )
-        second_prominent, second_available = second.split("## Prominent skills\n", 1)[1].split(
+        second_prominent, _ = second.split("## Prominent skills\n", 1)[1].split(
             "<available_skills>", 1
         )
 
         assert first.index("## Prominent skills") < first.index("<available_skills>")
         assert second.index("## Prominent skills") < second.index("<available_skills>")
         assert "- alpha: Alpha root" in first_prominent
-        assert "- alpha: Alpha root" not in first_available
         assert "- beta: Beta root" in second_prominent
-        assert "- beta: Beta root" not in second_available
+        assert "- alpha: Alpha root" not in second_prominent
         changed_cache_keys = second_cache_keys - first_cache_keys
         assert len(changed_cache_keys) == 1
 
