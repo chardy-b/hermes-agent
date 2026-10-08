@@ -463,6 +463,8 @@ class TestBuildSkillsSystemPrompt:
         assert "calendar" not in second
 
     def test_prominent_root_config_change_rebuilds_cached_prompt(self, monkeypatch, tmp_path):
+        import json
+        from agent import prompt_builder as pb
         from agent import skill_utils
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -480,14 +482,34 @@ class TestBuildSkillsSystemPrompt:
         )
 
         first = build_skills_system_prompt()
+        snapshot = json.loads(pb._skills_prompt_snapshot_path().read_text(encoding="utf-8"))
+        assert snapshot["version"] == pb._SKILLS_SNAPSHOT_VERSION
+        assert snapshot["manifest"] == pb._build_skills_manifest(tmp_path / "skills")
+        first_cache_keys = set(pb._SKILLS_PROMPT_CACHE)
+        assert first_cache_keys
+
         (tmp_path / "config.yaml").write_text(
             "skills:\n  prominent_roots:\n    - beta\n  root_catalog_limit: 1\n", encoding="utf-8"
         )
         skill_utils._raw_config_cache_clear()
         second = build_skills_system_prompt()
+        second_cache_keys = set(pb._SKILLS_PROMPT_CACHE)
 
-        assert "- alpha: Alpha root" in first
-        assert "- beta: Beta root" in second
+        first_prominent, first_available = first.split("## Prominent skills\n", 1)[1].split(
+            "<available_skills>", 1
+        )
+        second_prominent, second_available = second.split("## Prominent skills\n", 1)[1].split(
+            "<available_skills>", 1
+        )
+
+        assert first.index("## Prominent skills") < first.index("<available_skills>")
+        assert second.index("## Prominent skills") < second.index("<available_skills>")
+        assert "- alpha: Alpha root" in first_prominent
+        assert "- alpha: Alpha root" not in first_available
+        assert "- beta: Beta root" in second_prominent
+        assert "- beta: Beta root" not in second_available
+        changed_cache_keys = second_cache_keys - first_cache_keys
+        assert len(changed_cache_keys) == 1
 
     def test_prominent_roots_follow_project_precedence_and_external_visibility(self, monkeypatch, tmp_path):
         from agent import prompt_builder as pb

@@ -52,7 +52,7 @@ def _view(
     name="demo-dedup-skill",
     *,
     task="task-a",
-    session=None,
+    session="session-a",
     **projection,
 ):
     args = {"name": name, **projection}
@@ -147,8 +147,8 @@ class TestSkillViewDedup:
         assert first["retrieval_id"] == isolated["retrieval_id"]
 
     def test_different_tasks_do_not_share_cache(self, skills_home):
-        _view("demo-dedup-skill", task="task-A")
-        r = _view("demo-dedup-skill", task="task-B")
+        _view("demo-dedup-skill", task="task-A", session=None)
+        r = _view("demo-dedup-skill", task="task-B", session=None)
         assert "Alpha procedure" in r.get("content", "")
 
 
@@ -160,11 +160,11 @@ class TestSkillViewDedup:
 
 
     def test_task_scope_is_fallback_and_no_scope_never_dedups(self, skills_home):
-        _view(task="task-a")
-        assert _view(task="task-a")["dedup"] is True
-        assert _view(task="task-b").get("dedup") is not True
-        first = _view(task=None)
-        second = _view(task=None)
+        _view(task="task-a", session=None)
+        assert _view(task="task-a", session=None)["dedup"] is True
+        assert _view(task="task-b", session=None).get("dedup") is not True
+        first = _view(task=None, session=None)
+        second = _view(task=None, session=None)
         assert first.get("dedup") is not True
         assert second.get("dedup") is not True
         assert "content_hash" in first
