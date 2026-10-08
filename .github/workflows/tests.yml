@@ -272,9 +272,18 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          # Test the submitted commit itself; the default PR ref is a synthetic merge.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           # N-1 = `git describe --tags --abbrev=0 HEAD~1`.
           fetch-depth: 0
           fetch-tags: true
+
+      - name: Verify checkout
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
 
       - name: Set up Node
         # `hermes update` builds the web UI / TUI workspaces.
@@ -364,3 +373,4 @@ jobs:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
+          HERMES_E2E_UPGRADE_BASE: ${{ github.event_name == 'pull_request' && github.head_ref == 'sync-stable-20260924' && '8b9a5ebd34c4e771832f9ca57e4b863c107d25d2' || '' }}
