@@ -22,6 +22,9 @@ jobs:
           version: '0.12.13'
           enable-cache: true
       - name: Install locked test environment
+        run: uv sync --locked --python 3.11 --extra dev --extra messaging
+      - name: Install locked Hindsight extra (candidate)
+        if: matrix.source == 'candidate'
         run: uv sync --locked --python 3.11 --extra dev --extra messaging --extra hindsight
       - name: Verify exact revision and lock
         env:
