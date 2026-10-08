@@ -350,29 +350,22 @@ class TestBuildSkillsSystemPrompt:
         from agent import prompt_builder as pb
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        skills_dir = tmp_path / "skills" / "tools"
-        skill_dir = skills_dir / "calendar"
+        skills_dir = tmp_path / "skills"
+        skill_dir = skills_dir / "tools" / "calendar"
         skill_dir.mkdir(parents=True)
         (skill_dir / "SKILL.md").write_text(
             "---\nname: calendar\ndescription: Calendar integration\nrequires_apps: [calendar]\n---\n",
             encoding="utf-8",
         )
 
-        snapshot = {
-            "version": 3,
-            "manifest": pb._build_skills_manifest(skills_dir),
-            "skills": [{
-                "skill_name": "calendar",
-                "frontmatter_name": "calendar",
-                "description": "Calendar integration",
-                "platforms": [],
-                "conditions": {},
-            }],
-            "category_descriptions": {},
-        }
-        assert "requires_apps" not in snapshot["skills"][0]
-        pb._skills_prompt_snapshot_path().write_text(json.dumps(snapshot), encoding="utf-8")
         monkeypatch.setattr(pb, "skill_matches_apps", lambda frontmatter: not frontmatter.get("requires_apps"))
+        pb._build_skills_system_prompt_inner(skills_dir, [], None, None, None)
+        snapshot = json.loads(pb._skills_prompt_snapshot_path().read_text(encoding="utf-8"))
+        assert snapshot["version"] == 4
+        assert snapshot["manifest"] == pb._build_skills_manifest(skills_dir)
+        snapshot["version"] = 3
+        snapshot["skills"][0].pop("requires_apps")
+        pb._skills_prompt_snapshot_path().write_text(json.dumps(snapshot), encoding="utf-8")
 
         result = build_skills_system_prompt()
 
@@ -395,20 +388,36 @@ class TestBuildSkillsSystemPrompt:
         )
 
         monkeypatch.setenv("HERMES_HOME", str(home_a))
-        first = pb._build_skills_system_prompt_inner(skills_dir, [], None, None, None)
+        pb._build_skills_system_prompt_inner(skills_dir, [], None, None, None)
         snapshot_a = json.loads((home_a / ".skills_prompt_snapshot.json").read_text(encoding="utf-8"))
         snapshot_a["skills"][0]["description"] = "Profile A skill"
         (home_a / ".skills_prompt_snapshot.json").write_text(json.dumps(snapshot_a), encoding="utf-8")
 
-        monkeypatch.setenv("HERMES_HOME", str(home_b))
-        snapshot_b = dict(snapshot_a)
-        snapshot_b["skills"] = [dict(snapshot_a["skills"][0], description="Profile B skill")]
         home_b.mkdir(parents=True)
+        snapshot_b = json.loads(json.dumps(snapshot_a))
+        snapshot_b["skills"] = [dict(snapshot_a["skills"][0], description="Profile B skill")]
         (home_b / ".skills_prompt_snapshot.json").write_text(json.dumps(snapshot_b), encoding="utf-8")
+        pb._SKILLS_PROMPT_CACHE.clear()
+
+        rendered = []
+        real_render = pb._render_skills_index
+
+        def record_render(*args, **kwargs):
+            rendered.append(True)
+            return real_render(*args, **kwargs)
+
+        monkeypatch.setattr(pb, "_render_skills_index", record_render)
+        monkeypatch.setenv("HERMES_HOME", str(home_a))
+        first = pb._build_skills_system_prompt_inner(skills_dir, [], None, None, None)
+        assert pb._build_skills_system_prompt_inner(skills_dir, [], None, None, None) == first
+        monkeypatch.setenv("HERMES_HOME", str(home_b))
         second = pb._build_skills_system_prompt_inner(skills_dir, [], None, None, None)
+        assert pb._build_skills_system_prompt_inner(skills_dir, [], None, None, None) == second
 
         assert first != second
+        assert "Profile A skill" in first
         assert "Profile B skill" in second
+        assert len(rendered) == 2
 
     def test_app_availability_change_rebuilds_cached_snapshot(self, monkeypatch, tmp_path):
         from agent import prompt_builder as pb
@@ -431,7 +440,31 @@ class TestBuildSkillsSystemPrompt:
         assert "calendar" in first
         assert "calendar" not in second
 
+    def test_external_app_availability_change_rebuilds_cached_prompt(self, monkeypatch, tmp_path):
+        from agent import prompt_builder as pb
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        local = tmp_path / "skills"
+        external = tmp_path / "external-skills"
+        skill_dir = external / "calendar"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: calendar\ndescription: External calendar\nrequires_apps: [calendar]\n---\n",
+            encoding="utf-8",
+        )
+        available = {"value": True}
+        monkeypatch.setattr(pb, "skill_matches_apps", lambda frontmatter: available["value"])
+
+        first = pb._build_skills_system_prompt_inner(local, [external], None, None, None)
+        available["value"] = False
+        second = pb._build_skills_system_prompt_inner(local, [external], None, None, None)
+
+        assert "calendar" in first
+        assert "calendar" not in second
+
     def test_prominent_root_config_change_rebuilds_cached_prompt(self, monkeypatch, tmp_path):
+        from agent import skill_utils
+
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         skills_dir = tmp_path / "skills" / "tools"
         for name in ("alpha", "beta"):
@@ -448,8 +481,9 @@ class TestBuildSkillsSystemPrompt:
 
         first = build_skills_system_prompt()
         (tmp_path / "config.yaml").write_text(
-            "skills:\n  prominent_roots: [beta]\n  root_catalog_limit: 1\n", encoding="utf-8"
+            "skills:\n  prominent_roots:\n    - beta\n  root_catalog_limit: 1\n", encoding="utf-8"
         )
+        skill_utils._raw_config_cache_clear()
         second = build_skills_system_prompt()
 
         assert "- alpha: Alpha root" in first

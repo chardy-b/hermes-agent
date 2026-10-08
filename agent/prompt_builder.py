@@ -1250,6 +1250,31 @@ def _skill_should_show(
     )
 
 
+def _has_visible_app_gated_skill(
+    skill_files, disabled: set[str], available_tools: "set[str] | None",
+    available_toolsets: "set[str] | None", session_platform: str,
+) -> bool:
+    """Whether a non-snapshot tier contains a skill whose app gate can change."""
+    for skill_file in skill_files:
+        try:
+            frontmatter, _ = parse_frontmatter(skill_file.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.debug("Could not inspect app gate in skill %s: %s", skill_file, e)
+            continue
+        if not _requires_apps_list(frontmatter):
+            continue
+        if not skill_matches_platform(frontmatter) or not skill_matches_environment(frontmatter):
+            continue
+        skill_name = skill_file.parent.name
+        frontmatter_name = str(frontmatter.get("name") or skill_name)
+        if frontmatter_name in disabled or skill_name in disabled:
+            continue
+        if _skill_should_show(extract_skill_conditions(frontmatter), available_tools, available_toolsets,
+                              session_platform or None):
+            return True
+    return False
+
+
 def _current_session_platform_hint() -> str:
     """Active platform without importing the gateway package on CLI startup."""
     platform = os.environ.get("HERMES_PLATFORM") or os.environ.get("HERMES_SESSION_PLATFORM")
@@ -1424,32 +1449,40 @@ def _build_skills_system_prompt_inner(
     prominent_roots, root_catalog_limit = get_prominent_roots_config()
     project_dirs = project_dirs or []
     snapshot = _load_skills_snapshot(skills_dir)
-    # Profile/home, app availability, and prominent-root configuration all affect the rendered prompt.
-    # A missing snapshot deliberately disables cache reads: app-gated skills may have changed while the
-    # snapshot was unavailable, and the subsequent scan must rebuild the gating decision.
-    app_availability = None if snapshot is None else tuple(
-        (
-            str(entry.get("frontmatter_name") or entry.get("skill_name") or ""),
-            bool(skill_matches_apps({"requires_apps": entry.get("requires_apps") or []})),
-        )
-        for entry in snapshot.get("skills", [])
-        if isinstance(entry, dict)
+    # App availability is dynamic, so a cached prompt is unsafe whenever any visible tier has an app gate.
+    # Snapshot entries already carry that metadata; project and external entries must be inspected too.
+    app_gated = snapshot is not None and any(
+        entry.get("requires_apps") for entry in snapshot.get("skills", []) if isinstance(entry, dict)
     )
+    if snapshot is not None and not app_gated:
+        app_gated = any(
+            _has_visible_app_gated_skill(
+                iter_skill_index_files(ext_dir, "SKILL.md"), disabled, available_tools, available_toolsets,
+                _platform_hint,
+            )
+            for ext_dir in external_dirs if ext_dir.exists()
+        )
+        if not app_gated and project_dirs:
+            from agent.skill_utils import iter_project_skill_files
+            app_gated = any(
+                _has_visible_app_gated_skill(
+                    iter_project_skill_files(project_dir), disabled, available_tools, available_toolsets,
+                    _platform_hint,
+                )
+                for project_dir in project_dirs if project_dir.exists()
+            )
     cache_key = (
         hermes_home_key(), str(skills_dir), tuple(str(d) for d in external_dirs),
         tuple(str(d) for d in project_dirs),
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint, tuple(sorted(disabled)), tuple(sorted(compact_categories or ())),
-        prominent_roots, root_catalog_limit, app_availability,
+        prominent_roots, root_catalog_limit,
         _oneshot_prompt_variant(),
-    )
-    app_gated = snapshot is not None and any(
-        entry.get("requires_apps") for entry in snapshot.get("skills", []) if isinstance(entry, dict)
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
-        if cached is not None and app_availability is not None and not app_gated:
+        if cached is not None and snapshot is not None and not app_gated:
             _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
             return cached
 

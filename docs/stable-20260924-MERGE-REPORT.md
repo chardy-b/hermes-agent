@@ -18,7 +18,7 @@ Curator audits; progressive/composed retrieval and topology; prominent roots; co
 
 ## Validation gates
 
-Only the reviewed source, regression, workflow, and report files were edited. No local package installs, tests, builds, credentials, pushes, or commits were used; lightweight syntax checks were run only. Actual tests remain pending and no CI result is being claimed.
+The stale `docs/stable-review-proposals.json` scratch artifact was removed. The focused repository test runner was attempted but could not start because this checkout has no virtualenv with pytest; Python syntax compilation and JSON parsing passed. No package installs, builds, credentials, pushes, or commits were used. The full suite and CI remain pending; no test or broader CI result is being claimed.
 
 Independent exact-tree review and GitHub CI remain mandatory before deployment. A focused workflow checks both candidate and exact stable parent with locked dependencies and the repository test runner. Full PR CI covers broader regressions/builds. No deployment has occurred.
 
