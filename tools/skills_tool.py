@@ -14,9 +14,9 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_constants import get_hermes_home
+from agent.skill_topology import normalize_skill_topology, validate_skill_topology
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get
-from agent.skill_topology import normalize_skill_topology, validate_skill_topology
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS, is_skill_support_path as _is_skill_support_path)
 from tools.skills_tool_setup import (  # noqa: F401
@@ -27,7 +27,7 @@ from tools.skills_tool_plugin import (  # noqa: F401
     _mark_background_review_read, _preprocess_skill, _read_skill_text, _safe_frontmatter,
     _serve_plugin_skill, _serve_skill_file, _truncate_description)
 from tools.skills_tool_dedup import (  # noqa: F401
-    _skill_view_identity, _skill_view_scope, _skill_view_check_or_record, reset_skill_view_dedup)
+    _check_skill_view_dedup, _record_skill_view, reset_skill_view_dedup)
 from tools.skill_provenance import is_background_review
 
 logger = logging.getLogger(__name__)
@@ -115,6 +115,7 @@ def _skill_utils_delegate(attr: str):
 skill_matches_platform = _skill_utils_delegate("skill_matches_platform")
 # Offer-time relevance gate (kanban/docker/s6), NOT hard compatibility; explicit loads bypass it.
 skill_matches_environment = _skill_utils_delegate("skill_matches_environment")
+skill_matches_apps = _skill_utils_delegate("skill_matches_apps")
 _parse_frontmatter = _skill_utils_delegate("parse_frontmatter")
 _get_disabled_skill_names = _skill_utils_delegate("get_disabled_skill_names")
 
@@ -206,7 +207,7 @@ def _find_all_skills(*, skip_disabled: bool = False, include_character_count: bo
             try:
                 skill_text = _read_skill_text(skill_md)
                 frontmatter, body = _parse_frontmatter(skill_text[:4000])
-                if not skill_matches_platform(frontmatter) or not skill_matches_environment(frontmatter):
+                if not skill_matches_platform(frontmatter) or not skill_matches_environment(frontmatter) or not skill_matches_apps(frontmatter):
                     continue
                 name = frontmatter.get("name", skill_md.parent.name)[:MAX_NAME_LENGTH]
                 if name in seen_names or name in disabled:
@@ -248,7 +249,7 @@ def skills_list(category: str = None, task_id: str = None) -> str:
             for plugin_skill in get_plugin_manager().list_plugin_skill_metadata():
                 frontmatter = plugin_skill.pop("frontmatter", {})
                 if (not skill_matches_platform(frontmatter) or not skill_matches_environment(frontmatter)
-                        or _is_skill_disabled(plugin_skill["name"])):
+                        or not skill_matches_apps(frontmatter) or _is_skill_disabled(plugin_skill["name"])):
                     continue
                 plugin_skill["topology"] = normalize_skill_topology(frontmatter)
                 all_skills.append(plugin_skill)
@@ -272,7 +273,7 @@ def skills_list(category: str = None, task_id: str = None) -> str:
         return tool_error(str(e), success=False)
 
 
-def _resolve_plugin_skill(name, file_path, task_id, preprocess, **retrieval):
+def _resolve_plugin_skill(name, file_path, task_id, preprocess):
     """``plugin:skill`` dispatch: ``(result_json, None)`` when answered, else ``(None,
     local_category_name)`` to fall through to the flat-tree scan — categorized local skills also use
     ``category:skill`` in config/gateway prompts, so the on-disk ``category/skill`` form returns."""
@@ -307,7 +308,7 @@ def _resolve_plugin_skill(name, file_path, task_id, preprocess, **retrieval):
             f"has been cleaned up — try again after the plugin is reloaded."), None
     if plugin_skill_md is not None:
         return _serve_plugin_skill(
-            plugin_skill_md, namespace, bare, file_path=file_path, preprocess=preprocess, session_id=task_id, **retrieval), None
+            plugin_skill_md, namespace, bare, file_path=file_path, preprocess=preprocess, session_id=task_id), None
     if available := pm.list_plugin_skills(namespace):  # plugin exists but this specific skill is missing
         return _fail(
             f"Skill '{bare}' not found in plugin '{namespace}'.",
@@ -581,157 +582,20 @@ def _log_security_warnings(name: str, skill_md: Path, content: str, all_dirs, ac
         logger.warning("Skill security warning for '%s': %s", name, "; ".join(warnings))
 
 
-def _composition_metadata_resolver():
-    """Resolve bounded SKILL.md frontmatter without executing skill behavior."""
-    from copy import deepcopy
-
-    from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
-
-    roots = [_skills_dir(), *get_external_skills_dirs()]
-    indexed: dict[str, dict] = {}
-    indexed_plugins: dict[str, dict] = {}
-
-    def with_content_chars(frontmatter: dict, size: int) -> dict:
-        enriched = deepcopy(frontmatter)
-        metadata = enriched.get("metadata")
-        hermes = metadata.get("hermes") if isinstance(metadata, dict) else None
-        canonical = hermes.get("composition") if isinstance(hermes, dict) else None
-        alias = enriched.get("composition")
-        target = canonical if isinstance(canonical, dict) else alias
-        if isinstance(target, dict):
-            target.setdefault("content_chars", size)
-        return enriched
-
-    for root in roots:
-        if not root.exists():
-            continue
-        for path in iter_skill_index_files(root, "SKILL.md"):
-            try:
-                text = path.read_text(encoding="utf-8-sig", errors="replace")
-                frontmatter, _ = _parse_frontmatter(text)
-            except Exception:
-                continue
-            enriched = with_content_chars(frontmatter, len(text))
-            identifiers = [
-                path.parent.name,
-                frontmatter.get("name"),
-                path.parent.relative_to(root).as_posix(),
-            ]
-            for identifier in identifiers:
-                if isinstance(identifier, str) and identifier:
-                    indexed.setdefault(identifier, enriched)
-
-    def load(skill_id):
-        if skill_id in indexed:
-            return indexed[skill_id]
-        if skill_id in indexed_plugins:
-            return indexed_plugins[skill_id]
-        try:
-            from hermes_cli.plugins import get_plugin_manager
-
-            path = get_plugin_manager().find_plugin_skill(skill_id)
-            if path:
-                text = path.read_text(encoding="utf-8-sig", errors="replace")
-                frontmatter, _ = _parse_frontmatter(text)
-                enriched = with_content_chars(frontmatter, len(text))
-                indexed_plugins[skill_id] = enriched
-                return enriched
-        except Exception:
-            logger.debug("Could not resolve composition metadata for %s", skill_id, exc_info=True)
-        return None
-
-    return load
-
-def _has_composition_metadata(frontmatter: dict) -> bool:
-    if "composition" in frontmatter:
-        return True
-    metadata = frontmatter.get("metadata")
-    hermes = metadata.get("hermes") if isinstance(metadata, dict) else None
-    return isinstance(hermes, dict) and "composition" in hermes
-
-def _composition_type(frontmatter: dict) -> str:
-    from agent.skill_composition import parse_composition_metadata
-
-    parsed = parse_composition_metadata(frontmatter)
-    return parsed.get("type", "flat") if parsed.get("success", True) else "invalid"
-
-def _bounded_router_inventory(children: list[dict], max_chars: int) -> tuple[str, bool]:
-    content = "\n".join(
-        f"- {child['id']}: {child.get('trigger', '')}" for child in children
-    )
-    marker = "\n[... router inventory truncated ...]"
-    if len(content) <= max_chars:
-        return content, False
-    return content[: max_chars - len(marker)] + marker, True
-
-def _apply_composition(result, name, children, *, max_chars=8000):
-    from agent.skill_composition import validate_skill_composition
-
-    validation = validate_skill_composition(
-        name,
-        load_metadata=_composition_metadata_resolver(),
-        selected_children=children,
-    )
-    result["composition"] = validation
-    if not validation.get("success"):
-        result["success"] = False
-        result["error_code"] = validation.get(
-            "error_code", "composition_invalid_metadata"
-        )
-        result["error"] = validation.get(
-            "error_code", "composition_invalid_metadata"
-        )
-        return result
-    if validation.get("type") == "router":
-        result.setdefault("full_content_chars", len(result.get("content", "")))
-        result["composition_invariants"] = validation.get(
-            "inherited_invariants", {}
-        )
-        inventory = (
-            validation["selected_children"]
-            if children is not None
-            else validation["available_children"]
-        )
-        content, truncated = _bounded_router_inventory(inventory, max_chars)
-        result["content"] = content
-        result["linked_files"] = None
-        result["projection"] = {
-            "match_type": "composition",
-            "returned_chars": len(content),
-            "total_chars": validation["cost"]["direct_child_chars"],
-            "truncated": truncated,
-            "omitted_count": max(
-                0, len(validation["available_children"]) - len(inventory)
-            ),
-        }
-    return result
-
-
 def skill_view(
-    name: str, file_path: str = None, task_id: str = None, preprocess: bool = True, *,
-    heading: str | None = None, query: str | None = None, max_chars: int | None = None,
-    children: list[str] | None = None, force_full: bool = False) -> str:
+    name: str, file_path: str = None, task_id: str = None, preprocess: bool = True) -> str:
     """View a skill (SKILL.md) or a file within its directory, as JSON. ``name`` is a skill name
     or path ("axolotl", "03-fine-tuning/axolotl"); "plugin:skill" resolves plugin-provided
     skills. ``preprocess`` applies the configured SKILL.md template / inline shell rendering;
     slash/preload callers render the message themselves."""
     try:
-        if file_path and (heading is not None or query is not None or max_chars is not None or children is not None):
-            return json.dumps({"success": False, "error_code": "skill_view_invalid_projection", "error": "file_path cannot be combined with progressive arguments"}, ensure_ascii=False)
-        if heading is not None and query is not None:
-            return json.dumps({"success": False, "error_code": "skill_view_invalid_projection", "error": "heading and query are mutually exclusive"}, ensure_ascii=False)
-        # Validate projection bounds early for direct calls.
-        if max_chars is not None and not 256 <= max_chars <= 50000:
-            return json.dumps({"success": False, "error_code": "skill_view_invalid_projection", "error": "max_chars must be between 256 and 50000"}, ensure_ascii=False)
         # Validate before the ':' dispatch so a Windows drive path (C:\skills\foo) can't be
         # reinterpreted as a plugin namespace.
         if lookup_error := _skill_lookup_path_error(name):
             return _fail(lookup_error, hint=_LOOKUP_HINT)
         local_category_name: str | None = None
         if ":" in name:  # plugin registry; bare names use the flat-tree scan below
-            served, local_category_name = _resolve_plugin_skill(
-                name, file_path, task_id, preprocess, heading=heading, query=query,
-                max_chars=max_chars, children=children, force_full=force_full)
+            served, local_category_name = _resolve_plugin_skill(name, file_path, task_id, preprocess)
             if served is not None:
                 return served
         # The fall-through form (namespace/bare) joins onto each search dir too; re-validate it
@@ -789,35 +653,11 @@ def skill_view(
             # Internal: absolute source path for the repeat-view dedup fingerprint.
             "_source_path": str(skill_md),
             **readiness_extras}
-        if heading is not None or query is not None or max_chars is not None:
-            from agent.skill_composition import select_skill_content
-            projection = select_skill_content(rendered_content, heading=heading, query=query, max_chars=max_chars or 8000, linked_files=linked_files)
-            result["full_content_chars"] = len(rendered_content)
-            result["projection"] = {k: v for k, v in projection.items() if k != "content"}
-            result["content"] = projection["content"]
-            result["linked_files"] = projection.get("linked_files") or None
-
         _mark_background_review_read(skill_md)
         if frontmatter.get("compatibility"):  # agentskills.io optional fields
             result["compatibility"] = frontmatter["compatibility"]
         if isinstance(metadata, dict):
             result["metadata"] = metadata
-        composition_type = _composition_type(frontmatter)
-        if not force_full and (
-            children is not None
-            or composition_type == "router"
-            or (composition_type == "invalid" and _has_composition_metadata(frontmatter))
-        ):
-            result = _apply_composition(
-                result,
-                str(skill_name),
-                children,
-                max_chars=max_chars or 8000,
-            )
-
-        # Never remove the org trust/provenance warning when projecting content.
-        if header and (result.get("projection") or result.get("composition")):
-            result["content"] = header + result["content"]
         return _json(result)
     except Exception as e:
         return tool_error(str(e), success=False)
@@ -852,10 +692,6 @@ SKILL_VIEW_SCHEMA = {
                 "type": "string",
                 "description": "OPTIONAL: Path to a linked file within the skill (e.g., 'references/api.md', 'templates/config.yaml', 'scripts/validate.py'). Omit to get the main SKILL.md content.",
             },
-            "heading": {"type": "string"},
-            "query": {"type": "string"},
-            "max_chars": {"type": "integer", "minimum": 256, "maximum": 50000},
-            "children": {"type": "array", "items": {"type": "string"}, "maxItems": 64},
         },
         "required": ["name"],
     },
@@ -868,74 +704,30 @@ registry.register(
 
 
 def _skill_view_with_bump(args, **kw):
-    """Invoke skill_view, then bump view_count on success. Best-effort: a
-    telemetry failure never breaks the tool call."""
+    """Invoke skill_view, then bump view_count/use on success (best-effort). Repeat-view dedup
+    mirrors read_file's unchanged-stub: a SAME, unchanged skill file already loaded in this
+    session returns a short stub (cache cleared on context compression)."""
     name = args.get("name", "")
     task_id = kw.get("task_id")
-    # ── Repeat-view dedup ────────────────────────────────────────────
-    # Mirrors read_file's unchanged-stub: when this session already
-    # loaded the SAME skill file and it hasn't changed on disk, return a
-    # short stub instead of re-sending the full content (production
-    # mining: ~286k tokens of verbatim repeat skill_view content in one
-    # 400k-message window). The stub only ever replaces content that is
-    # already fully present earlier in this conversation, so the
-    # "skills must be loaded fully" rule is preserved — and the cache is
-    # cleared on context compression (same hook as read_file's dedup)
-    # so a post-compression re-view returns full content again.
-    result = skill_view(
-        name, file_path=args.get("file_path"), task_id=task_id,
-        heading=args.get("heading"), query=args.get("query"),
-        max_chars=args.get("max_chars"), children=args.get("children"),
-    )
-    try:
-        parsed = json.loads(result)
-    except (TypeError, ValueError):
-        return result
-    if not isinstance(parsed, dict) or not parsed.get("success"):
-        return result
-
-    try:
-        retrieval_id, content_hash, retrieval = _skill_view_identity(args, parsed)
-    except Exception as exc:
-        logger.warning("Could not compute skill_view content identity", exc_info=True)
-        return json.dumps(
-            {
-                "success": False,
-                "error_code": "skill_view_identity_failed",
-                "error": "Could not compute a safe skill content identity",
-                "name": parsed.get("name") or name,
-            },
-            ensure_ascii=False,
-        )
-
-    parsed["retrieval_id"] = retrieval_id
-    parsed["content_hash"] = content_hash
-    parsed.pop("_source_path", None)
-    setup_needed = parsed.get("setup_needed") or (
-        parsed.get("readiness_status") == "setup_needed"
-    )
-    if setup_needed:
-        return json.dumps(parsed, ensure_ascii=False)
-
-    scope = _skill_view_scope(task_id, kw.get("session_id"))
-    stub = None if is_background_review() else _skill_view_check_or_record(
-        scope, task_id, retrieval_id, content_hash, parsed, retrieval)
-    if stub is not None:
+    # The background-review fork shares the parent's task_id (prefix-cache parity). A stub there
+    # (a) skips the read-mark its read-before-write guard requires and (b) lets it patch from a
+    # possibly-pruned transcript copy (#95976). No dedup in the fork; None also keeps its views
+    # out of the parent's bucket.
+    dedup_task_id = None if is_background_review() else task_id
+    if (stub := _check_skill_view_dedup(dedup_task_id, name, args.get("file_path"))) is not None:
         return stub
-    resolved = parsed.get("name") or name
-    if resolved:
-        try:
-            from tools.skill_usage import bump_use, bump_view
-
-            bump_view(str(resolved))
-            bump_use(
-                str(resolved),
-                task_id=task_id,
-                session_id=kw.get("session_id"),
-            )
-        except Exception:
-            logger.debug("Could not record skill usage", exc_info=True)
-    return json.dumps(parsed, ensure_ascii=False)
+    result = skill_view(name, file_path=args.get("file_path"), task_id=task_id)
+    with suppress(Exception):
+        parsed = json.loads(result)
+        if isinstance(parsed, dict) and parsed.get("success"):
+            _record_skill_view(dedup_task_id, name, args.get("file_path"), parsed)
+            if resolved := parsed.get("name") or name:  # qualified forms return the canonical name
+                from tools.skill_usage import bump_use, bump_view
+                bump_view(str(resolved))
+                # Viewing is actively loading the skill to act on it — that counts as use
+                # (the curator's stale timer keys off last_used_at).
+                bump_use(str(resolved), task_id=kw.get("task_id"), session_id=kw.get("session_id"))
+    return result
 
 
 registry.register(

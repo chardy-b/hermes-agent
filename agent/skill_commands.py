@@ -171,7 +171,7 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
         from tools.skills_tool import _skills_dir, skill_view
         from agent.skill_utils import normalize_skill_lookup_name
         normalized = normalize_skill_lookup_name(raw_identifier)
-        loaded_skill = json.loads(skill_view(normalized, task_id=task_id, preprocess=False, force_full=True))
+        loaded_skill = json.loads(skill_view(normalized, task_id=task_id, preprocess=False))
     except Exception:
         return None
     if not loaded_skill.get("success"):
@@ -353,12 +353,12 @@ def skill_command_collision_note(name: str) -> Optional[str]:
 
 def _scan_skill_md(skill_md: Path, disabled: set, seen_names: set, commands: Dict[str, Dict[str, Any]]) -> None:
     """Register one SKILL.md in *commands* (no-op when filtered or colliding)."""
-    from tools.skills_tool import _parse_frontmatter, skill_matches_platform, skill_matches_environment
+    from tools.skills_tool import _parse_frontmatter, skill_matches_apps, skill_matches_platform, skill_matches_environment
     if any(part in _SCAN_SKIP_PARTS for part in skill_md.parts):
         return
     frontmatter, body = _parse_frontmatter(skill_md.read_text(encoding='utf-8'))
     # OS gate is hard; environment gate (kanban/docker/s6) is offer-time only.
-    if not skill_matches_platform(frontmatter) or not skill_matches_environment(frontmatter):
+    if not skill_matches_platform(frontmatter) or not skill_matches_environment(frontmatter) or not skill_matches_apps(frontmatter):
         return
     name = frontmatter.get('name', skill_md.parent.name)
     if name in seen_names or name in disabled:

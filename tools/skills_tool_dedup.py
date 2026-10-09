@@ -1,158 +1,90 @@
-"""Session-scoped, projection-aware skill content identity and repeat-view dedup.
-
-Cleared via ``reset_skill_view_dedup()`` on context compression and on a
-committed proactive tool-result prune, because both replace the original
-content with a one-line marker.
+"""skill_view repeat-view dedup registry: per-task cache of (skill name, file_path) ->
+(skill file mtime+size). A repeat view of an UNCHANGED file returns a short stub — the earlier
+tool result already carries the content verbatim. Cleared via ``reset_skill_view_dedup()`` on
+context compression AND on a committed proactive tool-result prune, because both replace the
+original content with a one-line marker.
 """
 
-import copy
-import hashlib
 import json
 import os
 import threading
 from typing import Dict
 
-_skill_view_tracker: Dict[str, Dict[str, dict]] = {}
-_skill_view_scope_tasks: Dict[str, set[str]] = {}
+_skill_view_tracker: Dict[str, Dict[tuple, tuple]] = {}
 _skill_view_tracker_lock = threading.Lock()
 _SKILL_VIEW_DEDUP_CAP = 200
-_SKILL_VIEW_SCOPE_ALIAS_CAP = 200
+
 _SKILL_VIEW_DEDUP_MESSAGE = (
-    "Skill content unchanged since it was loaded earlier in this conversation — "
-    "refer to the earlier skill_view result; it is still current and complete."
-)
+    "Skill content unchanged since it was loaded earlier in this "
+    "conversation — refer to the earlier skill_view result; it is still "
+    "current and complete. (Re-issued after context compression, this "
+    "returns the full content again.)")
 
 
-def _skill_view_identity(args, payload):
-    name = str(payload.get("name") or args.get("name") or "")
-    source_path = payload.get("_source_path")
-    source_identity = (
-        hashlib.sha256(
-            os.path.realpath(str(source_path)).encode("utf-8")
-        ).hexdigest()
-        if source_path
-        else None
-    )
-    max_chars = args.get("max_chars")
-    progressive = bool(payload.get("projection")) or any(
-        key in args for key in ("heading", "query", "max_chars", "children")
-    )
-    if progressive and max_chars is None:
-        max_chars = 8000
-    children = args.get("children", "__omitted__")
-    if children != "__omitted__":
-        children = None if children is None else sorted(set(children))
-    retrieval = {
-        "name": name,
-        "source_identity": source_identity,
-        "file_path": args.get("file_path"),
-        "heading": args.get("heading"),
-        "query": args.get("query"),
-        "max_chars": max_chars,
-        "children": children,
-    }
-    rid = hashlib.sha256(
-        json.dumps(
-            retrieval,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode()
-    ).hexdigest()
-    visible = copy.deepcopy(payload)
-    visible.pop("_source_path", None)
-    visible.pop("content_hash", None)
-    visible.pop("retrieval_id", None)
-    chash = hashlib.sha256(
-        json.dumps(
-            visible,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode()
-    ).hexdigest()
-    return rid, chash, retrieval
-
-
-def _skill_view_scope(task_id, session_id):
-    return "session:" + str(session_id) if session_id else ("task:" + str(task_id) if task_id else None)
-
-
-def _associate_skill_view_scope(task_id, scope):
-    if not task_id or not scope:
-        return
-    task_key = str(task_id)
-    scopes = _skill_view_scope_tasks.setdefault(task_key, set())
-    scopes.add(scope)
-    while len(_skill_view_scope_tasks) > _SKILL_VIEW_SCOPE_ALIAS_CAP:
-        oldest_task = next(iter(_skill_view_scope_tasks))
-        if oldest_task == task_key and len(_skill_view_scope_tasks) == 1:
-            break
-        evicted_scopes = _skill_view_scope_tasks.pop(oldest_task, set())
-        for evicted_scope in evicted_scopes:
-            _skill_view_tracker.pop(evicted_scope, None)
-            for aliases in _skill_view_scope_tasks.values():
-                aliases.discard(evicted_scope)
-
-
-def reset_skill_view_dedup(
-    task_id: str | None = None,
-    *,
-    session_id: str | None = None,
-) -> None:
-    session_id = session_id or None
-    with _skill_view_tracker_lock:
-        if task_id is None and session_id is None:
-            _skill_view_tracker.clear()
-            _skill_view_scope_tasks.clear()
-        else:
-            scopes = set()
-            if task_id is not None:
-                task_key = str(task_id)
-                scopes.update(_skill_view_scope_tasks.pop(task_key, set()))
-                scopes.add("task:" + task_key)
-            if session_id:
-                scopes.add("session:" + str(session_id))
-            for scope in scopes:
-                _skill_view_tracker.pop(scope, None)
-            for aliases in _skill_view_scope_tasks.values():
-                aliases.difference_update(scopes)
-
-
-def _skill_view_check_or_record(
-    scope,
-    task_id,
-    retrieval_id,
-    content_hash,
-    payload,
-    retrieval,
-):
-    if not scope:
+def _skill_view_fingerprint(payload: dict) -> tuple | None:
+    """Stat the skill file a successful skill_view served, for change detection."""
+    if not (src := payload.get("_source_path")):
         return None
+    try:
+        st = os.stat(src)
+        return (src, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _record_skill_view(task_id, name, file_path, payload: dict) -> None:
+    """Record a served skill_view so an identical repeat can be deduped."""
+    # Never dedup setup-needed views: readiness depends on config/env state that
+    # changes without the file changing; the model must see the refreshed status.
+    if (not task_id or payload.get("setup_needed")
+            or payload.get("readiness_status") == "setup_needed"):
+        return
+    if (fp := _skill_view_fingerprint(payload)) is None:
+        return
+    key = (str(payload.get("name") or name), file_path or "")
     with _skill_view_tracker_lock:
-        _associate_skill_view_scope(task_id, scope)
-        cache = _skill_view_tracker.setdefault(scope, {})
-        prior = cache.get(retrieval_id)
-        if prior and prior["content_hash"] == content_hash:
-            return json.dumps(
-                {
-                    "success": True,
-                    "status": "unchanged",
-                    "name": payload.get("name"),
-                    "file": payload.get("file", "SKILL.md"),
-                    "dedup": True,
-                    "content_returned": False,
-                    "content_hash": content_hash,
-                    "retrieval_id": retrieval_id,
-                    "projection_identity": retrieval,
-                    "message": _SKILL_VIEW_DEDUP_MESSAGE,
-                },
-                ensure_ascii=False,
-            )
-        cache[retrieval_id] = {
-            "content_hash": content_hash,
-            "retrieval": retrieval,
-        }
-        while len(cache) > _SKILL_VIEW_DEDUP_CAP:
-            cache.pop(next(iter(cache)))
+        cache = _skill_view_tracker.setdefault(str(task_id), {})
+        cache[key] = fp
+        while len(cache) > _SKILL_VIEW_DEDUP_CAP:  # FIFO eviction
+            del cache[next(iter(cache))]
+
+
+def _check_skill_view_dedup(task_id, name, file_path) -> str | None:
+    """Dedup stub when this exact skill file was already served to this task and
+    is unchanged on disk; None otherwise."""
+    if not task_id:
+        return None
+    n = str(name)
+    with _skill_view_tracker_lock:
+        if not (cache := _skill_view_tracker.get(str(task_id))):
+            return None
+        # Record key is the RESOLVED name; match raw and resolved forms so
+        # 'category/skill' and bare-name views coalesce.
+        for key, (src, mtime_ns, size) in list(cache.items()):
+            rec_name, rec_fp = key
+            if rec_fp != (file_path or "") or (
+                    rec_name != n and not n.endswith("/" + rec_name)
+                    and not rec_name.endswith("/" + n) and n.split(":")[-1] != rec_name):
+                continue
+            try:
+                st = os.stat(src)
+                changed = (st.st_mtime_ns, st.st_size) != (mtime_ns, size)
+            except OSError:
+                changed = True
+            if changed:
+                cache.pop(key, None)
+                return None
+            return json.dumps({
+                "success": True, "status": "unchanged", "name": rec_name,
+                "file": file_path or "SKILL.md", "dedup": True, "content_returned": False,
+                "message": _SKILL_VIEW_DEDUP_MESSAGE}, ensure_ascii=False)
     return None
+
+
+def reset_skill_view_dedup(task_id: str | None = None) -> None:
+    """Clear the dedup cache (all tasks when task_id is None); called on context compression."""
+    with _skill_view_tracker_lock:
+        if task_id is None:
+            _skill_view_tracker.clear()
+        else:
+            _skill_view_tracker.pop(str(task_id), None)

@@ -122,9 +122,7 @@ def _preprocess_skill(content: str, skill_dir, session_id, debug_msg: str, *args
 
 def _serve_plugin_skill(
     skill_md: Path, namespace: str, bare: str, file_path: str | None = None, *,
-    preprocess: bool = True, session_id: str | None = None,
-    heading: str | None = None, query: str | None = None, max_chars: int | None = None,
-    children: list[str] | None = None, force_full: bool = False) -> str:
+    preprocess: bool = True, session_id: str | None = None) -> str:
     """Read a plugin-provided skill, apply guards, return JSON."""
     from hermes_cli.plugins import _get_disabled_plugins, get_plugin_manager
     from tools import skills_tool as _st
@@ -155,42 +153,11 @@ def _serve_plugin_skill(
     rendered_content = content if not preprocess else _preprocess_skill(
         content, skill_md.parent, session_id, "Could not preprocess plugin skill %s:%s",
         namespace, bare)
-    projected = None
-    full_content_chars = len(rendered_content)
-    if heading is not None or query is not None or max_chars is not None:
-        from agent.skill_composition import select_skill_content
-        if heading is not None and query is not None:
-            return json.dumps({"success": False, "error_code": "skill_view_invalid_projection", "error": "heading and query are mutually exclusive"}, ensure_ascii=False)
-        try:
-            projected = select_skill_content(rendered_content, heading=heading, query=query, max_chars=max_chars or 8000, linked_files=_plugin_skill_linked_files(skill_md.parent))
-            rendered_content = projected.pop("content")
-        except ValueError as exc:
-            return json.dumps({"success": False, "error_code": "skill_view_invalid_projection", "error": str(exc)}, ensure_ascii=False)
-
-    result = {
-        "success": True,
-        "name": f"{namespace}:{bare}",
-        "content": f"{banner}{rendered_content}" if banner and projected is None else rendered_content,
+    return _json({
+        "success": True, "name": qualified_name, "content": banner + rendered_content,
         "description": _truncate_description(str(parsed_frontmatter.get("description", ""))),
-        "linked_files": (projected or {}).get("linked_files") if projected is not None else _plugin_skill_linked_files(skill_md.parent),
-        "readiness_status": SkillReadinessStatus.AVAILABLE.value,
-    }
-    if projected is not None:
-        result["projection"] = projected
-        result["full_content_chars"] = full_content_chars
-    composition_type = _st._composition_type(parsed_frontmatter)
-    if not force_full and (
-        children is not None
-        or composition_type == "router"
-        or (composition_type == "invalid" and _st._has_composition_metadata(parsed_frontmatter))
-    ):
-        result = _st._apply_composition(
-            result,
-            f"{namespace}:{bare}",
-            children,
-            max_chars=max_chars or 8000,
-        )
-    return json.dumps(result, ensure_ascii=False)
+        "linked_files": _plugin_skill_linked_files(skill_md.parent),
+        "readiness_status": SkillReadinessStatus.AVAILABLE.value})
 
 
 def _plugin_skill_linked_files(skill_root: Path) -> Dict[str, List[str]] | None:
