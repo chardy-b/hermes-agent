@@ -117,7 +117,10 @@ def _session_mutation_context(request, profile):
     from gateway.session_authorities import authority_for_home
     runner = getattr(request.app.state, 'gateway_runner', None)
     owner = authority_for_home(runner, home) if runner is not None else None
-    if owner is None and home.resolve() == Path(authority.db.db_path).parent.resolve():
+    # Match on the store each side names, both fully resolved: comparing the parent of the
+    # authority's store path assumed `<home>/state.db` is a real file, so a home whose store is a
+    # symlink onto another volume never matched and this fell through to 403 profile_mismatch.
+    if owner is None and (home / 'state.db').resolve() == Path(authority.db.db_path).resolve():
         owner = authority
     if owner is None:
         raise HTTPException(status_code=403, detail='profile_mismatch')
