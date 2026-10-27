@@ -5,8 +5,35 @@ import asyncio
 import errno
 import os
 import re
-import signal
+import sys
+from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
+
+
+class _OwnedLoginProcess:
+    """Observe CLI exit separately from the lifetime of its process group owner."""
+
+    def __init__(self, supervisor):
+        self._supervisor = supervisor
+        self._exit = asyncio.create_task(self._read_exit())
+
+    async def _read_exit(self):
+        status = await self._supervisor.stdout.readline()
+        return int(status) if status else await self._supervisor.wait()
+
+    @property
+    def returncode(self):
+        return self._exit.result() if self._exit.done() else None
+
+    async def wait(self):
+        return await asyncio.shield(self._exit)
+
+    async def close(self):
+        # Only the live supervisor signals its own group. Repeated cleanup,
+        # or an already-exited supervisor, cannot signal a recycled identifier.
+        self._supervisor.stdin.close()
+        await self._supervisor.wait()
+        await self.wait()
 
 
 class ClaudeLoginProcess:
@@ -16,6 +43,7 @@ class ClaudeLoginProcess:
         self.oauth_url = ""
         self._buffer = bytearray()
         self._ready = asyncio.Event()
+        self._closed = False
         self._loop = asyncio.get_running_loop()
         self._loop.add_reader(master, self._read)
 
@@ -35,20 +63,18 @@ class ClaudeLoginProcess:
             termios.tcsetattr(slave, termios.TCSANOW, attrs)
             os.set_blocking(master, False)
             spawning = asyncio.create_task(asyncio.create_subprocess_exec(
-                *command, "auth", "login", stdin=slave, stdout=slave, stderr=slave,
-                env=env, start_new_session=True,
+                sys.executable, "-I", str(Path(__file__).with_name("claude_oauth_supervisor.py")),
+                str(slave), *command, "auth", "login",
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+                pass_fds=(slave,), env=env, start_new_session=True,
             ))
             try:
-                process = await asyncio.shield(spawning)
+                process = _OwnedLoginProcess(await asyncio.shield(spawning))
             except asyncio.CancelledError:
                 # Cancellation during exec must not orphan a child that is still being created.
-                process = await spawning
-                if process.returncode is None:
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                await process.wait()
+                process = _OwnedLoginProcess(await spawning)
+                await process.close()
                 raise
         except BaseException:
             os.close(master)
@@ -135,14 +161,13 @@ class ClaudeLoginProcess:
         return await self.process.wait()
 
     async def close(self):
+        if self._closed:
+            return
         self._loop.remove_reader(self.master)
         self._buffer.clear()
         self.oauth_url = ""
-        # Kill the owned session's children too (e.g. a browser opener), never a PID from a request.
-        if self.alive:
-            try:
-                os.killpg(self.process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        await self.process.wait()
+        await self.process.close()
+        if self._closed:
+            return
         os.close(self.master)
+        self._closed = True
