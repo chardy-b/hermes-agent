@@ -3,12 +3,90 @@ watch_match, watch_disabled, watch_overflow_*, async_delegation) into the
 ``[IMPORTANT: ...]`` / ``[ASYNC DELEGATION ...]`` text the CLI drain loop, gateway and
 TUI inject into the agent conversation."""
 
+import logging
 import time
-from dataclasses import dataclass
 from contextlib import suppress
+from dataclasses import dataclass
 
+logger = logging.getLogger(__name__)
 _DONE = ("completed", "success")
 _REASON_STATUS = {"lost": "marked lost because the process backend disappeared", "failed_start": "failed to start"}
+
+
+class ProcessNotificationMixin:
+    def drain_notifications(
+        self, session_key: str = "", owns_event=None, *, skip_poll_observed: bool = True,
+    ) -> list[tuple[dict, str]]:
+        """Pop owned events as ``(raw_event, formatted_text)`` pairs; requeue foreign ones."""
+        self.restore_completions()
+        results, requeue = [], []
+        surface_child: bool | None = None
+        while not self.completion_queue.empty():
+            try:
+                evt = self.completion_queue.get_nowait()
+            except Exception:  # health: allow BLE001 -- preserve the heterogeneous queue drain boundary
+                break
+            is_delegation = evt.get("type") == "async_delegation"
+            if not self._owns_event(evt, session_key, owns_event, is_delegation):
+                requeue.append(evt)
+                continue
+            if self.heartbeat_process_exited(evt):
+                continue
+            event_session_id = evt.get("session_id", "")
+            if evt.get("type") == "completion" and self._drain_should_skip(
+                event_session_id, skip_poll_observed=skip_poll_observed,
+            ):
+                continue
+            event_task_id = str(evt.get("owner_task_id") or evt.get("task_id") or "")
+            if is_child_process_notification(evt):
+                if surface_child is None:
+                    surface_child = self._surface_child_process_notifications()
+                if not should_surface_notification(evt, surface_child=surface_child):
+                    logger.debug(
+                        "Suppressed subagent-owned process notification "
+                        "(delegation.surface_child_process_notifications=false): "
+                        "type=%s session_id=%s task_id=%s",
+                        evt.get("type", "completion"), event_session_id, event_task_id)
+                    continue
+            if text := format_process_notification(evt):
+                results.append((evt, text))
+        for evt in requeue:
+            self.completion_queue.put(evt)
+        return results
+
+    def heartbeat_process_exited(self, evt: dict) -> bool:
+        """True only when the exact in-memory owner of a heartbeat has exited.
+
+        Unknown IDs fail open. Unlike ``ProcessRegistry.get()``, this performs no prefix
+        resolution, disk I/O, or detached-process reconciliation on a consumer thread.
+        """
+        if evt.get("type") != "heartbeat":
+            return False
+        session_id = evt.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            return False
+        with self._lock:
+            session = self._running.get(session_id) or self._finished.get(session_id)
+        if session is None:
+            return False
+        with session._lock:
+            return session.exited
+
+
+def _output_tail(session, n: int) -> str:
+    """Last *n* chars of the session output with ANSI sequences stripped."""
+    from tools.ansi_strip import strip_ansi
+
+    return strip_ansi(session.output_buffer[-n:])
+
+
+def _completion_output(session) -> dict:
+    """Completion-sized output shared by notifications and process snapshots."""
+    from tools.process_registry import COMPLETION_OUTPUT_CHARS
+
+    limit = session.completion_output_chars or COMPLETION_OUTPUT_CHARS
+    cut = len(session.output_buffer) - limit
+    return {"output": _output_tail(session, limit), **({"output_cut": cut} if cut > 0 else {})}
 
 
 @dataclass(frozen=True, slots=True)

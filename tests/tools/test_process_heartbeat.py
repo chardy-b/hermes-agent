@@ -7,6 +7,7 @@ heartbeats stop at exit, and the normal completion notice still fires.
 """
 import json
 import queue
+import threading
 import time
 
 import pytest
@@ -84,6 +85,122 @@ def test_a_tick_with_no_new_output_queues_nothing():
 
     registry._emit_heartbeat(session, now=400.0)
     assert _drain(registry.completion_queue) == []
+
+
+def test_finish_between_due_snapshot_and_emission_suppresses_heartbeat(monkeypatch):
+    """A timer snapshot is stale as soon as the registry lock is released.  Finishing in
+    that gap must leave completion as the final (and only) queued process event."""
+    monkeypatch.setattr(pr, "save_completed_result", lambda _session: None)
+    registry = ProcessRegistry()
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+    session = pr.ProcessSession(
+        id="proc_snapshot_race",
+        command="build",
+        notify_on_complete=True,
+        heartbeat_seconds=60,
+        started_at=1.0,
+    )
+    session.append_output("last output\n")
+    registry._running[session.id] = session
+
+    now = 100.0
+    with registry._lock:
+        due = [
+            candidate for candidate in registry._running.values()
+            if candidate.heartbeat_seconds > 0 and not candidate.exited
+            and now - candidate._heartbeat_last >= candidate.heartbeat_seconds
+        ]
+    assert due == [session]
+
+    registry._finish_exited(session, 0)
+    for candidate in due:
+        registry._emit_heartbeat(candidate, now)
+
+    assert [event["type"] for event in _drain(registry.completion_queue)] == ["completion"]
+
+
+def test_heartbeat_publication_fence_orders_barrier_interleaving(monkeypatch):
+    """Once heartbeat publication reaches the queue, completion cannot overtake it.  The
+    barrier holds that exact interleaving open and the joins prove the fence has no deadlock."""
+    monkeypatch.setattr(pr, "save_completed_result", lambda _session: None)
+    registry = ProcessRegistry()
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+    reached_queue = threading.Barrier(2)
+    release_heartbeat = threading.Event()
+
+    class BarrierQueue(queue.Queue):
+        def put(self, item, block=True, timeout=None):
+            if item.get("type") == "heartbeat":
+                reached_queue.wait(timeout=5)
+                if not release_heartbeat.wait(timeout=5):
+                    raise AssertionError("heartbeat barrier was not released")
+            return super().put(item, block=block, timeout=timeout)
+
+    registry.completion_queue = BarrierQueue()
+    session = pr.ProcessSession(
+        id="proc_barrier_race",
+        command="build",
+        notify_on_complete=True,
+        heartbeat_seconds=60,
+        started_at=1.0,
+    )
+    session.append_output("progress\n")
+    registry._running[session.id] = session
+
+    emitter = threading.Thread(target=registry._emit_heartbeat, args=(session, 100.0))
+    emitter.start()
+    reached_queue.wait(timeout=5)
+
+    # Queue.put is part of the state transaction: completion cannot expose ``exited``
+    # until it returns, so a heartbeat can never appear after that transition.
+    fence_was_free = session._lock.acquire(blocking=False)
+    if fence_was_free:
+        session._lock.release()
+    assert not fence_was_free
+
+    finisher_started = threading.Barrier(2)
+
+    def finish():
+        finisher_started.wait(timeout=5)
+        registry._finish_exited(session, 0)
+
+    finisher = threading.Thread(target=finish)
+    finisher.start()
+    finisher_started.wait(timeout=5)
+    release_heartbeat.set()
+    emitter.join(timeout=5)
+    finisher.join(timeout=5)
+
+    assert not emitter.is_alive() and not finisher.is_alive()
+    assert [event["type"] for event in _drain(registry.completion_queue)] == ["heartbeat", "completion"]
+
+
+def test_common_drain_drops_only_exact_known_exited_heartbeats():
+    registry = ProcessRegistry()
+    registry._completions_restored = True
+    live = pr.ProcessSession(id="proc_live_exact", command="build")
+    exited = pr.ProcessSession(id="proc_exited_exact", command="build", exited=True, exit_code=0)
+    registry._running[live.id] = live
+    registry._finished[exited.id] = exited
+
+    def heartbeat(session_id):
+        return {"type": "heartbeat", "session_id": session_id, "command": "build",
+                "seq": 1, "interval": 60, "elapsed": 60, "output": "progress\n"}
+
+    events = [
+        heartbeat(exited.id),
+        heartbeat(live.id),
+        heartbeat("proc_unknown"),
+        heartbeat("proc_exited"),  # a unique prefix is not an exact heartbeat identity
+        {"type": "completion", "session_id": exited.id, "command": "build",
+         "exit_code": 0, "output": "done\n"},
+    ]
+    for event in events:
+        registry.completion_queue.put(event)
+
+    drained = [event for event, _text in registry.drain_notifications(owns_event=lambda _event: True)]
+
+    assert drained == events[1:]
 
 
 def test_schema_minimum_heartbeat_is_disabled_for_foreground(monkeypatch):
