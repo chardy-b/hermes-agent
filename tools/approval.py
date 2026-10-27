@@ -29,7 +29,8 @@ from tools.approval_context import (
     get_current_session_key,
 )
 from tools.approval_detection import (
-    _approval_key_aliases, _check_sudo_stdin_guard, detect_dangerous_command, detect_hardline_command,
+    REMOTE_EXECUTION_DESCRIPTIONS, _approval_key_aliases, _check_sudo_stdin_guard, detect_dangerous_command,
+    detect_hardline_command,
 )
 from tools.approval_floors import (
     _command_matches_permanent_allowlist, _hardline_block_result, _match_user_deny_rule, _sudo_stdin_block_result,
@@ -1201,7 +1202,9 @@ def check_all_command_guards(command: str, env_type: str,
         _COMMAND_GATE, command=command, description=description,
         pattern_key=pattern_key, pattern_keys=[pattern_key],
         session_key=session_key, approval_callback=approval_callback,
-        is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask, smart=approval_mode == "smart",
+        is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask,
+        # The guardian cannot vouch for downloaded code it has not seen, so a human always reviews it.
+        smart=approval_mode == "smart" and description not in REMOTE_EXECUTION_DESCRIPTIONS,
     )
 
 

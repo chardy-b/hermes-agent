@@ -24,6 +24,12 @@ MAX_OUTPUT_CHARS = 700
 _MAX_TOKENS = 300
 _DEFAULT_TIMEOUT = 8.0
 _MAX_TIMEOUT = 30.0
+_REMOTE_CAVEAT = "Warning: what the downloaded script does is unknown unless it has been reviewed."
+_CAVEAT_PRESENT_RE = re.compile(
+    r"\b(?:script|installer|downloaded|remote|contents?|effects?|behavior)\b"
+    r".{0,100}\b(?:unknown|unreviewed|unverified|not (?:been )?(?:reviewed|verified))\b",
+    re.IGNORECASE,
+)
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
@@ -138,4 +144,17 @@ def explain_for_prompt(text: str, *, kind: str) -> dict | None:
         return _result("unavailable", "", previewed, total)
     if not answer or len(answer) > MAX_OUTPUT_CHARS:
         return _result("unavailable", "", previewed, total)
+    if kind == "command" and _runs_remote_script(text) and not _CAVEAT_PRESENT_RE.search(answer):
+        # Reserve room for the safety warning rather than dropping it or exceeding the output bound.
+        room = MAX_OUTPUT_CHARS - len(_REMOTE_CAVEAT) - 1
+        answer = f"{answer[:room].rstrip()} {_REMOTE_CAVEAT}"
     return _result("ok", answer, previewed, total)
+
+
+def _runs_remote_script(command: str) -> bool:
+    """Whether the command executes downloaded code. Deterministic, so the model cannot omit or be talked out of it."""
+    from tools.approval_detection import REMOTE_EXECUTION_DESCRIPTIONS, detect_dangerous_command
+    try:
+        return detect_dangerous_command(str(command or ""))[2] in REMOTE_EXECUTION_DESCRIPTIONS
+    except Exception:  # health: allow BLE001 -- the caveat is advisory; a detector failure must not turn a good explanation into "unavailable"
+        return False
