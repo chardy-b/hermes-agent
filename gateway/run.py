@@ -3043,17 +3043,17 @@ def _format_gateway_process_notification(evt: dict) -> str | None:
 def _drain_gateway_watch_events(completion_queue) -> list[dict]:
     """Drain gateway-owned watch events without spinning on requeued events.
     Foreign events requeued inside ``while not queue.empty()`` never terminate: detach, then requeue."""
-    watch_events: list[dict] = []
-    requeue: list[dict] = []
+    from tools.process_registry import process_registry
+    watch_events, requeue = [], []
     while not completion_queue.empty():
         try:
             evt = completion_queue.get_nowait()
         except Exception:
             break
         evt_type = evt.get("type", "completion")
-        if evt_type in {
-            "watch_match", "watch_disabled", "watch_overflow_tripped", "watch_overflow_released",
-            "heartbeat"}:
+        if (evt_type in {"watch_match", "watch_disabled", "watch_overflow_tripped",
+                         "watch_overflow_released", "heartbeat"}
+                and not process_registry.heartbeat_process_exited(evt)):
             watch_events.append(evt)
         elif evt_type == "async_delegation":
             requeue.append(evt)

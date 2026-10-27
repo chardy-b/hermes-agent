@@ -849,6 +849,30 @@ def test_gateway_drain_retains_and_formats_overflow_events():
     assert "exit code" not in out_released
 
 
+def test_gateway_direct_drain_drops_only_exact_known_exited_heartbeats(monkeypatch):
+    import tools.process_registry as pr
+    from gateway.run import _drain_gateway_watch_events
+
+    registry = pr.ProcessRegistry()
+    live = pr.ProcessSession(id="proc_live_exact", command="build")
+    exited = pr.ProcessSession(id="proc_exited_exact", command="build", exited=True, exit_code=0)
+    registry._running[live.id] = live
+    registry._finished[exited.id] = exited
+    monkeypatch.setattr(pr, "process_registry", registry)
+    events = [
+        {"type": "heartbeat", "session_id": exited.id},
+        {"type": "heartbeat", "session_id": live.id},
+        {"type": "heartbeat", "session_id": "proc_unknown"},
+        {"type": "heartbeat", "session_id": "proc_exited"},
+        {"type": "watch_match", "session_id": exited.id, "output": "READY"},
+    ]
+    queued = queue.Queue()
+    for event in events:
+        queued.put(event)
+
+    assert _drain_gateway_watch_events(queued) == events[1:]
+
+
 @pytest.mark.asyncio
 async def test_raw_output_modes_are_human_facing(monkeypatch, tmp_path):
     """#54266: the chat-facing watcher messages (final in all/result/error, interim in all) carry a

@@ -57,7 +57,11 @@ def test_off_mutes_process_wakes_but_subagent_results_still_land(surface, tmp_pa
         yaml.safe_dump({"display": {"background_process_notifications": "off"}}), encoding="utf-8"
     )
     session = _session(tmp_path)
-    registry = SimpleNamespace(completion_queue=queue.Queue(), is_completion_consumed=lambda session_id: False)
+    registry = SimpleNamespace(
+        completion_queue=queue.Queue(),
+        heartbeat_process_exited=lambda _event: False,
+        is_completion_consumed=lambda session_id: False,
+    )
     completions: list = []
 
     for evt in (HEARTBEAT, COMPLETION):
@@ -67,3 +71,33 @@ def test_off_mutes_process_wakes_but_subagent_results_still_land(surface, tmp_pa
 
     assert server._notif_handle_event("sid", session, dict(DELEGATION), set(), registry, lambda e: "t", completions) is True
     assert [kw["display_kind"] for _, kw in surface] == ["async_delegation_complete"]
+
+
+def test_tui_direct_path_drops_only_exact_known_exited_heartbeats(monkeypatch, surface):
+    import tools.process_registry as pr
+
+    registry = pr.ProcessRegistry()
+    live = pr.ProcessSession(id="proc_live_exact", command="build")
+    exited = pr.ProcessSession(id="proc_exited_exact", command="build", exited=True, exit_code=0)
+    registry._running[live.id] = live
+    registry._finished[exited.id] = exited
+    monkeypatch.setattr(server, "_background_notifications_off", lambda _session: True)
+    formatted = []
+
+    def fmt(event):
+        formatted.append((event["type"], event["session_id"]))
+        return "notification"
+
+    session = _session()
+    events = [
+        {"type": "heartbeat", "session_id": exited.id},
+        {"type": "heartbeat", "session_id": live.id},
+        {"type": "heartbeat", "session_id": "proc_unknown"},
+        {"type": "heartbeat", "session_id": "proc_exited"},
+        {"type": "completion", "session_id": exited.id},
+    ]
+    for event in events:
+        assert server._notif_handle_event(
+            "sid", session, event, set(), registry, fmt, None, owned=True) is True
+
+    assert formatted == [(event["type"], event["session_id"]) for event in events[1:]]

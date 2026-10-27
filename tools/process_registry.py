@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Literal, NamedTuple, Optional
 from hermes_cli.config import get_hermes_home
 
 from tools.process_registry_notifications import (
-    format_process_notification, heartbeat_output_tail, is_child_process_notification, should_surface_notification)
+    _completion_output, _output_tail, heartbeat_output_tail, ProcessNotificationMixin)
 from tools.process_registry_checkpoint import ProcessCheckpointMixin
 from tools.process_registry_output_log import ProcessOutputLogMixin, open_output_log, record_exit_command, worker_output_log
 from tools.process_registry_termination import ProcessTerminationMixin
@@ -520,24 +520,6 @@ def _not_found(session_id: str) -> dict:
     return {"status": "not_found", "error": f"No process with ID {session_id}"}
 
 
-def _output_tail(session: "ProcessSession", n: int) -> str:
-    """Last *n* chars of the session output with ANSI sequences stripped."""
-    from tools.ansi_strip import strip_ansi
-
-    return strip_ansi(session.output_buffer[-n:])
-
-
-def _completion_output(session: "ProcessSession") -> dict:
-    """``output`` sized by the session's ``completion_output_chars`` plus ``output_cut`` when trimmed.
-
-    Shared by the completion notification AND the wait/poll/kill snapshots: a bot in an api_server
-    or one-shot session cannot receive notifications and polls instead, so the polled result must
-    carry the same whole reply and the same cut marker (#115334)."""
-    limit = session.completion_output_chars or COMPLETION_OUTPUT_CHARS
-    cut = len(session.output_buffer) - limit
-    return {"output": _output_tail(session, limit), **({"output_cut": cut} if cut > 0 else {})}
-
-
 @dataclass
 class ProcessSession:
     """A tracked background process with output buffering."""
@@ -589,6 +571,8 @@ class ProcessSession:
     _heartbeat_last: float = field(default=0.0, repr=False)          # time of the last heartbeat (or spawn)
     _heartbeat_total_at_last: int = field(default=0, repr=False)     # total_output_chars at that moment
     _heartbeat_seq: int = field(default=0, repr=False)
+    # Serializes emitters while _lock fences each heartbeat against the exit transition.
+    _heartbeat_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _watch_hits: int = field(default=0, repr=False)          # total matches delivered
     _watch_suppressed: int = field(default=0, repr=False)    # matches dropped by rate limit
     _watch_disabled: bool = field(default=False, repr=False) # permanently killed after strike limit
@@ -671,7 +655,9 @@ _WSL_CHAIN_NOTE = (
 )
 
 
-class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOutputLogMixin):
+class ProcessRegistry(
+    ProcessNotificationMixin, ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOutputLogMixin,
+):
     """In-memory registry of running and finished background processes.
     Thread-safe: accessed from executor threads (terminal_tool, process handlers),
     the gateway asyncio loop (watchers, reset checks) and the cleanup thread."""
@@ -758,27 +744,41 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         """Queue a heartbeat carrying the output since the last one. A tick with nothing new is
         skipped outright: every queued event costs the owner a full model turn, and "still running,
         no output" is already visible on the process surfaces (status stack, /agents dock)."""
-        session._heartbeat_last = now
-        with session._lock:
-            delta = session.total_output_chars - session._heartbeat_total_at_last
-            output = session.output_buffer[-delta:] if delta > 0 else ""
-            session._heartbeat_total_at_last = session.total_output_chars
-        if not output:
-            return
-        output, omitted = heartbeat_output_tail(output)
-        session._heartbeat_seq += 1
-        notification = {
-            **self._watch_event_base(session),
-            "type": "heartbeat",
-            "seq": session._heartbeat_seq,
-            "interval": session.heartbeat_seconds,
-            "elapsed": int(now - session.started_at) if session.started_at else 0,
-            "output": output,
-            "omitted": omitted,
-            "started_at": session.started_at,
-        }
-        _redact_process_result(notification)
-        self.completion_queue.put(notification)
+        # The due list is only a snapshot under the registry lock.  Redact without _lock
+        # (redaction may consult the registry), then atomically recheck exit and queue.
+        with session._heartbeat_lock:
+            with session._lock:
+                if session.exited:
+                    return
+                session._heartbeat_last = now
+                delta = session.total_output_chars - session._heartbeat_total_at_last
+                output = session.output_buffer[-delta:] if delta > 0 else ""
+                if not output:
+                    session._heartbeat_total_at_last = session.total_output_chars
+                    return
+                total_at_emit = session.total_output_chars
+                seq = session._heartbeat_seq + 1
+            output, omitted = heartbeat_output_tail(output)
+            notification = {
+                **self._watch_event_base(session),
+                "type": "heartbeat",
+                "seq": seq,
+                "interval": session.heartbeat_seconds,
+                "elapsed": int(now - session.started_at) if session.started_at else 0,
+                "output": output,
+                "omitted": omitted,
+                "started_at": session.started_at,
+            }
+            _redact_process_result(notification)
+            with session._lock:
+                if session.exited:
+                    return
+                session._heartbeat_total_at_last = total_at_emit
+                session._heartbeat_seq = seq
+                # Completion takes _lock to expose exited before it publishes.  Keeping the
+                # queue write inside that fence makes heartbeat-before-exit or no heartbeat
+                # the only possible outcomes, without any registry/session lock inversion.
+                self.completion_queue.put(notification)
 
     @staticmethod
     def _clean_shell_noise(text: str) -> str:
@@ -1825,61 +1825,6 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             return 0
         finally:
             reset_hermes_home_override(token)
-
-    def drain_notifications(
-        self, session_key: str = "", owns_event=None, *, skip_poll_observed: bool = True,
-    ) -> list[tuple[dict, str]]:
-        """Pop all pending events and return ``(raw_event, formatted_text)`` pairs.
-        Skips completions per ``_drain_should_skip`` (gateway/TUI pass
-        ``skip_poll_observed=False``). Routing (``_owns_event``): async-delegation events
-        always need ownership proof, ordinary events once they carry ``session_key`` or
-        ``origin_ui_session_id``; ``owns_event(evt)`` (strongest; the TUI passes a
-        compression-chain-aware check) consumes ONLY on True, ``session_key`` uses plain
-        equality; non-owned events are re-queued for their owner. No filter consumes
-        everything (legacy single-session) except restored delegation payloads (fail-closed)."""
-        self.restore_completions()
-        results: list[tuple[dict, str]] = []
-        requeue: list[dict] = []
-        # delegation.surface_child_process_notifications, read at most once per drain
-        # and only when an sa- event shows up.
-        surface_child: bool | None = None
-        while not self.completion_queue.empty():
-            try:
-                evt = self.completion_queue.get_nowait()
-            except Exception:
-                break
-            is_async_delegation = evt.get("type") == "async_delegation"
-            if not self._owns_event(evt, session_key, owns_event, is_async_delegation):
-                requeue.append(evt)
-                continue
-            # Routing happened first so a foreign session cannot drop the owner's
-            # event via its own consumed/observed state.
-            _evt_sid = evt.get("session_id", "")
-            if evt.get("type") == "completion" and self._drain_should_skip(
-                _evt_sid, skip_poll_observed=skip_poll_observed):
-                continue
-            # Subagent-owned process notifications are suppressed by default — the
-            # child's delegation result is the deliverable. Judge ownership on
-            # owner_task_id (RAW spawning id; task_id is the container key, collapsed
-            # by _resolve_container_task_id). Dropped, NOT requeued: children never
-            # drain, so a requeue would pin the event forever. 'async_delegation'
-            # is the result itself and is NEVER suppressed.
-            _evt_task_id = str(evt.get("owner_task_id") or evt.get("task_id") or "")
-            if is_child_process_notification(evt):
-                if surface_child is None:
-                    surface_child = self._surface_child_process_notifications()
-                if not should_surface_notification(evt, surface_child=surface_child):
-                    logger.debug(
-                        "Suppressed subagent-owned process notification "
-                        "(delegation.surface_child_process_notifications=false): "
-                        "type=%s session_id=%s task_id=%s",
-                        evt.get("type", "completion"), _evt_sid, _evt_task_id)
-                    continue
-            if text := format_process_notification(evt):
-                results.append((evt, text))
-        for evt in requeue:
-            self.completion_queue.put(evt)
-        return results
 
     # Minimum suffix chars for prefix resolution; "p"/"proc_1" are too collision-prone.
     _MIN_PREFIX_CHARS = 4
