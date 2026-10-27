@@ -82,3 +82,57 @@ def format_approval_deadline_line(timeout_s: int) -> str:
 
 def format_approval_timed_out_notice(timeout_s: int) -> str:
     return approval_timed_out_notice(format_approval_window(timeout_s))
+
+
+def ea_explanation_parts(explanation: dict | None) -> tuple[str, str] | None:
+    """``(label, body)`` for the optional AI explanation of the flagged command, or None when the prompt
+    carries none. An unavailable explanation renders as an explicit notice, and a prefix-only one says
+    how much of the command the model saw. Adapters wrap these bare strings in their own markup."""
+    if not explanation:
+        return None
+    label = t("gateway.exec_approval.explanation_label")
+    if explanation.get("status") != "ok" or not explanation.get("text"):
+        return label, t("gateway.exec_approval.explanation_unavailable")
+    body = str(explanation["text"])
+    previewed, total = explanation.get("previewed_chars", 0), explanation.get("total_chars", 0)
+    if previewed < total:
+        body += " " + t("gateway.exec_approval.explanation_partial", previewed=previewed, total=total)
+    return label, body
+
+
+def ea_explanation_text(explanation: dict | None) -> str:
+    """Plain-text ``Label: body`` paragraph (blank-line terminated) for the text fallback; "" without one."""
+    parts = ea_explanation_parts(explanation)
+    return f"{parts[0]}: {parts[1]}\n\n" if parts else ""
+
+
+def redact_explanation(explanation: dict | None) -> dict | None:
+    """Copy of the payload's AI explanation with its text re-redacted for display (the explainer already
+    redacted it; this is the egress-side guard, like ``gateway.run._redact_approval_command``)."""
+    if not explanation:
+        return None
+    from agent.redact import redact_sensitive_text
+    return {**explanation, "text": redact_sensitive_text(str(explanation.get("text") or ""), force=True)}
+
+
+def fit_escaped(text: str, budget: int, suffix: str, escape, len_fn) -> str:
+    """Longest prefix of *text* whose ``escape``d form measures ``<= budget`` in ``len_fn`` units, plus *suffix*
+    when cut (the suffix rides outside the budget). Escaped length is monotonic in the raw prefix, so bisect."""
+    if len_fn(escape(text)) <= budget:
+        return text
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        lo, hi = (mid, hi) if len_fn(escape(text[:mid])) <= budget else (lo, mid - 1)
+    return text[:lo] + suffix
+
+
+def ea_explanation_block(explanation: dict | None, markup, escape, len_fn, budget: int) -> str:
+    """The AI-explanation paragraph (leading blank line) between the reason and the deadline line, "" without
+    one. *markup* wraps ``(label, body)`` in the platform's formatting; a positive *budget* caps the body in
+    escaped ``len_fn`` units."""
+    parts = ea_explanation_parts(explanation)
+    if parts is None:
+        return ""
+    label, body = parts
+    return "\n\n" + markup(label, fit_escaped(body, budget, "...", escape, len_fn) if budget else body)

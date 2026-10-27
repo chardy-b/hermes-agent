@@ -427,8 +427,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import fence_state_after
 from gateway.platforms.base_exec_approval import (
-    approval_timeout_seconds, ea_action_labels, ea_default_reason_text, ea_header_text,
-    ea_reason_label_text, ea_smart_deny_line_text, format_approval_deadline_line)
+    approval_timeout_seconds, ea_action_labels, ea_default_reason_text, ea_explanation_block, ea_header_text,
+    ea_reason_label_text, ea_smart_deny_line_text, fit_escaped, format_approval_deadline_line)
 from gateway.platforms.base_streaming_tts import (
     AudioFormat, StreamingTTSHandle, streaming_tts_should_skip_whole_file, streaming_tts_turn_key)
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
@@ -1590,6 +1590,7 @@ class ExecApprovalPrompt:
     description: str
     smart_denied: bool
     metadata: Optional[dict[str, Any]] = None
+    explanation: Optional[dict[str, Any]] = None  # advisory only; never part of the choice set
 
     @property
     def choices(self) -> list[str]:
@@ -2705,6 +2706,7 @@ class BasePlatformAdapter(ABC):
     _EA_DEADLINE_PREFIX: str = "\n\n"  # separates the deadline line from the reason line
     _EA_CMD_BUDGET: int = 3000
     _EA_REASON_BUDGET: int = 0  # 0 = the reason is never truncated
+    _EA_EXPLANATION_BUDGET: int = 0  # 0 = the explanation (already size-capped upstream) is never truncated
 
     @property
     def _EA_HEADER(self) -> str:
@@ -2733,30 +2735,22 @@ class BasePlatformAdapter(ABC):
         ``message_len_fn`` units: the platform cap applies to the wire payload, and escaping
         expands (``&`` → ``&amp;``), so a raw-length cut can still overflow. Returns raw text (the
         caller escapes); ``suffix`` rides outside ``budget`` like ``_truncate_preview``."""
-        text = str(text or "")
-        escape = escape or self._ea_escape
-        len_fn = self.message_len_fn
-        if len_fn(escape(text)) <= budget:
-            return text
-        lo, hi = 0, len(text)
-        while lo < hi:  # escaped length is monotonic in the raw prefix, so bisect it
-            mid = (lo + hi + 1) // 2
-            if len_fn(escape(text[:mid])) <= budget:
-                lo = mid
-            else:
-                hi = mid - 1
-        return text[:lo] + suffix
+        return fit_escaped(str(text or ""), budget, suffix, escape or self._ea_escape, self.message_len_fn)
 
     def _exec_approval_cmd_budget(self, description: str, smart_denied: bool) -> int:
         """Chars of command preview that fit; platforms with a hard message cap compute it."""
         return self._EA_CMD_BUDGET
+
+    def _ea_explanation_markup(self, label: str, body: str) -> str:
+        return f"{self._ea_escape(label)}: {self._ea_escape(body)}"
 
     def _ea_deadline_line(self) -> str:
         """The "doing nothing means it will NOT run" line, with the configured approvals.timeout."""
         return self._EA_DEADLINE_PREFIX + self._ea_escape(format_approval_deadline_line(approval_timeout_seconds()))
 
     def _format_exec_approval(
-        self, command: str, description: Optional[str] = None, smart_denied: bool = False) -> str:
+        self, command: str, description: Optional[str] = None, smart_denied: bool = False,
+        explanation: Optional[dict] = None) -> str:
         """Shared exec-approval prompt text: header + fenced (truncated) command + why it was
         flagged + the deadline line, plus the smart-deny line. Buttons/trailing instructions stay
         platform-local. ``description=None`` renders the localized default reason."""
@@ -2764,12 +2758,15 @@ class BasePlatformAdapter(ABC):
             description = ea_default_reason_text()
         if self._EA_REASON_BUDGET:
             description = self._ea_fit(str(description or ""), self._EA_REASON_BUDGET)
+        explanation_block = ea_explanation_block(
+            explanation, self._ea_explanation_markup, self._ea_escape, self.message_len_fn, self._EA_EXPLANATION_BUDGET)
         cmd_preview = self._ea_fit(
-            str(command or ""), self._exec_approval_cmd_budget(description, smart_denied))
+            str(command or ""),
+            max(0, self._exec_approval_cmd_budget(description, smart_denied) - self.message_len_fn(explanation_block)))
         text = (f"{self._EA_HEADER}"
                 f"{self._EA_CODE_OPEN}{self._ea_escape(cmd_preview)}{self._EA_CODE_CLOSE}"
                 f"{self._EA_REASON_LABEL}{self._ea_escape(description)}"
-                f"{self._ea_deadline_line()}")
+                f"{explanation_block}{self._ea_deadline_line()}")
         return text + self._EA_SMART_DENY_LINE if smart_denied else text
 
     # ── Exec-approval prompt (template method). The choice set is one rule for every button
@@ -2802,7 +2799,7 @@ class BasePlatformAdapter(ABC):
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str, description: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None, allow_permanent: bool = True, allow_session: bool = True,
-        smart_denied: bool = False,
+        smart_denied: bool = False, explanation: Optional[dict] = None,
     ) -> SendResult:
         """Interactive exec-approval prompt; a press resolves via
         ``tools.approval.resolve_gateway_approval``. Text and choice set are shared; adapters
@@ -2811,8 +2808,8 @@ class BasePlatformAdapter(ABC):
             description = ea_default_reason_text()
         prompt = ExecApprovalPrompt(
             chat_id=chat_id, session_key=session_key, metadata=metadata, command=str(command or ""),
-            description=description, smart_denied=smart_denied,
-            text=self._format_exec_approval(command, description, smart_denied),
+            description=description, smart_denied=smart_denied, explanation=explanation,
+            text=self._format_exec_approval(command, description, smart_denied, explanation),
             actions=self._exec_approval_actions(
                 allow_permanent=allow_permanent, allow_session=allow_session, smart_denied=smart_denied))
         return await self._send_exec_approval_prompt(prompt)

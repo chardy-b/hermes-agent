@@ -37,6 +37,7 @@ from tools.approval_floors import (
 )
 from tools.approval_gateway_wait import _await_gateway_decision
 from tools.approval_prompt import _present_with_selected_transport, _transport_choice, prompt_dangerous_approval
+from tools import approval_explain
 from tools.approval_smart import _smart_verdict
 
 logger = logging.getLogger(__name__)
@@ -696,6 +697,7 @@ class _GateSpec:
     cli_timeout: str          # {breaker}
     cli_denied: str           # {description}{breaker}
     smart_log: str            # {command}{description}{session_key}
+    explain: bool = False     # a shown gateway prompt carries an optional aux-model explanation
 
 
 _STOP_COMMAND = (
@@ -722,7 +724,7 @@ _COMMAND_GATE = _GateSpec(
     cli_timeout="BLOCKED: Command timed out without user response." + _STOP_COMMAND
                 + " Silence is not consent.{breaker}",
     cli_denied="BLOCKED: User denied this command." + _STOP_COMMAND + "{breaker}",
-    smart_log="Smart approval: auto-approved '{command}' ({description})",
+    smart_log="Smart approval: auto-approved '{command}' ({description})", explain=True,
 )
 _EXECUTE_CODE_GATE = _GateSpec(
     noun="code", transport=True, user_approved=True, redact_cli=True, pending_keys=True,
@@ -741,7 +743,7 @@ _EXECUTE_CODE_GATE = _GateSpec(
         "BLOCKED: User denied execute_code script execution (matched "
         "'{description}'). Do NOT retry — the user has explicitly rejected it.{breaker}"
     ),
-    smart_log="Smart approval: auto-approved execute_code for session {session_key}",
+    smart_log="Smart approval: auto-approved execute_code for session {session_key}", explain=True,
 )
 # Plugin-escalated tool calls / protected writes: no transport, no breaker,
 # no user_approved marker (parity with the historical gate).
@@ -791,6 +793,14 @@ def _smart_gate(spec: _GateSpec, command: str, description: str, pattern_key: st
                     f"dangerous. Do NOT retry.{_denial_breaker_addendum(session_key)}"),
         "smart_denied": True,
     }, True
+
+
+def _attach_explanation(spec: _GateSpec, data: dict, command: str) -> None:
+    """Add the optional AI explanation to a gateway prompt payload. Display-only: asked here, once a prompt is
+    certain to be shown and the verdict is settled, and never read by anything that decides."""
+    explanation = approval_explain.explain_for_prompt(command, kind=spec.noun) if spec.explain else None
+    if explanation is not None:
+        data["explanation"] = explanation
 
 
 def _human_decision(spec: _GateSpec, *, command: str, description: str,
@@ -866,6 +876,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             }
             if smart_denied:
                 data["smart_denied"] = True
+            _attach_explanation(spec, data, command)
             decision = _await_gateway_decision(session_key, notify_cb, data, surface="gateway")
             if decision.get("notify_failed"):
                 return _denied(spec.notify_failed, pattern_key=pattern_key,
