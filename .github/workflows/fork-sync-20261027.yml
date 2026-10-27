@@ -1,0 +1,114 @@
+name: Fork sync 2026-10-27 validation
+
+# Fork-only acceptance for the upstream-sync branch. Keep this independent of
+# the upstream CI orchestrator and every publishing workflow.
+on:
+  push:
+    branches:
+      - teo/sync-upstream-20261027
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-sync-20261027-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TARGET_SHA: ${{ github.event_name == 'push' && github.event.after || github.sha }}
+  HERMES_TEST_WORKERS: '1'
+  HERMES_TEST_FILE_RETRIES: '0'
+
+jobs:
+  validate:
+    name: Validate exact sync head
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out the exact requested revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Publish and verify the exact revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_sha=$(git rev-parse HEAD)
+          echo "Requested SHA: $TARGET_SHA"
+          echo "Checked out SHA: $actual_sha"
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$actual_sha" = "$TARGET_SHA"
+          printf '## Fork sync validation\n\nExact SHA: %s\n' "$actual_sha" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up locked Python and Node toolchains
+        uses: ./.github/actions/setup-pm
+        with:
+          toolchain: all
+          extras: '["all", "trace-upload"]'
+          test-environment: 'true'
+          save-tools-cache: 'false'
+          save-python-cache: 'false'
+          save-node-cache: 'false'
+
+      - name: Verify Python lockfile consistency
+        run: python -m pm.build_env --source . --check-lock
+
+      - name: Lint and compile sync-resolved Python
+        shell: bash
+        run: |
+          set -euo pipefail
+          python_files=(
+            agent/prompt_builder.py
+            agent/skill_utils.py
+            tools/skills_tool.py
+            hermes_cli/web_routers/skills.py
+            gateway/platforms/api_server.py
+            tests/agent/test_prompt_builder.py
+          )
+          ruff check "${python_files[@]}"
+          python -m py_compile "${python_files[@]}"
+
+      - name: Test prominent skill roots
+        run: scripts/run_tests.sh tests/agent/test_prompt_builder.py -- -k prominent -q
+
+      - name: Test skill discovery and cache behavior
+        run: scripts/run_tests.sh tests/tools/test_skills_tool.py tests/tools/test_skills_tool_discovery_cache.py -- -q
+
+      - name: Test dashboard skill profiles
+        run: scripts/run_tests.sh tests/hermes_cli/test_web_server_skills_profiles.py -- -q
+
+      - name: Test companion API
+        run: scripts/run_tests.sh tests/gateway/test_companion_api.py -- -q
+
+      - name: Test tool progress and pairing invitations
+        run: scripts/run_tests.sh tests/gateway/test_chat_completions_tool_progress_optout.py tests/test_pairing_invitations.py -- -q
+
+      - name: Verify npm lockfile and install frontend dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ls --package-lock-only --all --depth=0
+          npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Typecheck and build dashboard and TUI
+        shell: bash
+        env:
+          HERMES_WEB_BUILD_LIGHT: '1'
+        run: |
+          set -euo pipefail
+          npm run typecheck --workspace web
+          npm run typecheck --workspace ui-tui
+          node scripts/build/web.mjs \
+            --source "$GITHUB_WORKSPACE" \
+            --icons "$GITHUB_WORKSPACE" \
+            --out "$RUNNER_TEMP/fork-sync-web"
+          node scripts/build/tui.mjs \
+            --source "$GITHUB_WORKSPACE" \
+            --out "$RUNNER_TEMP/fork-sync-tui"
+
+      - name: Check the checkout is clean
+        uses: ./.github/actions/check-clean-worktree
