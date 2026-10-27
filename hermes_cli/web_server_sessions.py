@@ -116,9 +116,18 @@ def _session_mutation_context(request, profile):
     # ``?profile=`` selects a served home; its own authority (not the launch one) owns the mutation.
     from gateway.session_authorities import authority_for_home
     runner = getattr(request.app.state, 'gateway_runner', None)
-    owner = authority_for_home(runner, home) if runner is not None else None
-    if owner is None and home.resolve() == Path(authority.db.db_path).parent.resolve():
+    if runner is not None:
+        # A multiplexed runner's registry is the served-profile boundary. A parked or otherwise
+        # unserved profile may name the launch store through a symlink, but that does not grant it
+        # the launch authority.
+        owner = authority_for_home(runner, home)
+    elif (home.resolve() == Path(authority.profile_id).resolve()
+          and (home / 'state.db').resolve() == Path(authority.db.db_path).resolve()):
+        # Standalone serve/dashboard has no registry. Match both the authority's launch home and
+        # the store each side names; store identity alone would let another home alias this store.
         owner = authority
+    else:
+        owner = None
     if owner is None:
         raise HTTPException(status_code=403, detail='profile_mismatch')
     authority = owner

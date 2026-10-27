@@ -45,8 +45,26 @@ async def _build_profile_authority(runner, name, home, *, register):
         db = getattr(runner._session_db, '_db', runner._session_db)
         if db is None:
             raise RuntimeError(_store_open_failure(runner, home))
-        if (await asyncio.to_thread(Path(db.db_path).resolve)).parent != home:
-            raise RuntimeError(f'session authority database does not belong to the reserved profile {home}')
+        # Compare the store this handle opened against the store this home *names*, both fully
+        # resolved. Taking the parent of the resolved path instead assumed `<home>/state.db` is a
+        # real file, so a home whose store is a symlink onto another volume (a routine relocation
+        # off a small root disk) was judged to belong to that volume and failed boot. Resolving
+        # both sides keeps the guard — another profile's store still resolves elsewhere — while a
+        # relocated store compares equal, and a symlinked home (macOS /tmp) still does too.
+        expected, actual = await asyncio.gather(
+            asyncio.to_thread((home / 'state.db').resolve),
+            asyncio.to_thread(Path(db.db_path).resolve))
+        if actual != expected:
+            raise RuntimeError(f'session authority database does not belong to the reserved profile {home}: '
+                               f'opened {actual}, expected {expected}')
+        existing = list(registry)
+        existing_stores = await asyncio.gather(*(
+            asyncio.to_thread(Path(owner.db.db_path).resolve) for owner in existing))
+        duplicate = next((owner for owner, store in zip(existing, existing_stores) if store == actual), None)
+        if duplicate is not None:
+            raise RuntimeError(
+                f'session authority database for reserved profile {home} is already owned by '
+                f'{duplicate.profile_id}: {actual}')
         registry.add(home, None, name=name)
         try:
             authority = await initialize_session_authority(
