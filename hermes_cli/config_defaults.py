@@ -1662,19 +1662,18 @@ DEFAULT_CONFIG = {
     # timeout: seconds before an unanswered prompt fails closed (CLI and gateway). 60s
     #   proved too tight for Telegram/Discord push notifications, hence 300.
     "approvals": {
-        # single_query_mode — what to do when a single-query (-q) session hits a dangerous command. -q runs
-        # export HERMES_INTERACTIVE=1 (for interactive sudo prompts) but have NO user waiting to answer
-        # approval prompts — an unanswered prompt just waits the full timeout then fails closed, so the
-        # agent is forced to work around the block (often via execute_code). This setting makes that intent
-        # explicit: deny    — block the command and let the agent find another way (default, safe; mirrors
-        # cron_mode deny) approve — auto-approve all dangerous commands in single-query mode These surfaces
-        # bind a session platform like chat gateways do, but have no send_exec_approval and no /approve
-        # channel — a pending approval there just blocks for the full timeout with nobody to answer (#37284,
-        # #87509): deny    — block the command instantly and let the agent find another way (default, safe;
-        # mirrors cron_mode deny) approve — auto-approve all dangerous commands on unattended platforms
-        # Shared by the CLI prompt and gateway/messaging waits. Messaging approvals arrive as a push
-        # notification the user may not see immediately — 60s proved too tight on Telegram/Discord (the
-        # prompt expired before the user reached their phone), so the default is 300.
+        # single_query_mode — what to do when a single-query (-q) session hits a dangerous command. -q runs export
+        # HERMES_INTERACTIVE=1 (for interactive sudo prompts) but have NO user waiting to answer approval prompts — an
+        # unanswered prompt just waits the full timeout then fails closed, so the agent is forced to work around the
+        # block (often via execute_code). This setting makes that intent explicit: deny    — block the command and let
+        # the agent find another way (default, safe; mirrors cron_mode deny) approve — auto- approve all dangerous
+        # commands in single-query mode These surfaces bind a session platform like chat gateways do, but have no
+        # send_exec_approval and no /approve channel — a pending approval there just blocks for the full timeout with
+        # nobody to answer (#37284, #87509): deny    — block the command instantly and let the agent find another way
+        # (default, safe; mirrors cron_mode deny) approve — auto- approve all dangerous commands on unattended platforms
+        # Shared by the CLI prompt and gateway/messaging waits. Messaging approvals arrive as a push notification the
+        # user may not see immediately — 60s proved too tight on Telegram/Discord (the prompt expired before the user
+        # reached their phone), so the default is 300.
         "mode": "smart",
         "timeout": 300,
         "cron_mode": "deny",
@@ -1683,6 +1682,7 @@ DEFAULT_CONFIG = {
         # Extra rules appended to the smart-approval guardian's SYSTEM prompt, e.g. "Always ESCALATE
         # commands touching /etc".
         "smart_policy": "",
+        "explain": False, "explain_timeout": 8,  # AI explanation on gateway prompts (sends the redacted command to the aux `approval` model); timeout 1-30s
         # After this many consecutive guardian DENYs in a session, the deny message escalates to a
         # hard-stop (report to user / ask for /approve). Approval resets; 0 off.
         "denial_breaker_threshold": 3,

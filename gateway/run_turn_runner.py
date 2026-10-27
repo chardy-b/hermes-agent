@@ -698,6 +698,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
     def _render_approval_sync(self, approval_data: dict) -> None:
         """Send the approval request from the agent thread: the adapter's interactive button
         approvals (``send_exec_approval``) when available, else plain text with ``/approve`` steps."""
+        from gateway.platforms.base_exec_approval import redact_explanation
         from gateway.run import _approval_send_outcome, _format_exec_approval_fallback, _interim_metadata, _redact_approval_command
         from gateway.run_turn_runner_approval_settle import register_timeout_notice
         ctx = self._ctx
@@ -711,6 +712,10 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         cmd = _redact_approval_command(approval_data.get("command", ""))
         desc = approval_data.get("description") or ea_default_reason_text()
         flags = {k: approval_data.get(k, d) for k, d in (("allow_permanent", True), ("allow_session", True), ("smart_denied", False))}
+        # Advisory only, carried beside (never inside) the detector reason; absent unless the gate attached one.
+        explanation = redact_explanation(approval_data.get("explanation"))
+        if explanation is not None:
+            flags["explanation"] = explanation
         # Check the *class*, not the instance — MagicMock auto-creates attributes in tests.
         if _renders_exec_approval_buttons(type(adapter)):
             try:

@@ -4229,6 +4229,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         return "\n\n" + _bold_label_html(t("gateway.exec_approval.smart_deny_line"))
 
     _EA_REASON_BUDGET = 500  # escaped chars; the reason shares the 4096 cap with the command
+    _EA_EXPLANATION_BUDGET = 1000  # escaped chars; same cap, the command gives up room for both
+
+    def _ea_explanation_markup(self, label: str, body: str) -> str:
+        return f"<b>{_html.escape(label)}:</b> {_html.escape(body)}"
 
     def _ea_escape(self, text: str) -> str:
         return _html.escape(text)
