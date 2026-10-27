@@ -1908,6 +1908,9 @@ class GatewayShutdownMixin:
     async def _stop_release_runtime_state(self, ctx: "GatewayShutdownMixin._StopContext") -> None:
         """Cancel background tasks, flush pending messages, clear per-session state, final tool kill."""
         from gateway.run import GatewayRunner
+        if getattr(self, "_claude_login_attempt", None) is not None:
+            from gateway.slash_commands_claude_login import close_claude_login
+            await close_claude_login(self)
         for _task in list(self._background_tasks):
             # _restart_task awaits _stop_task: cancelling it would tunnel into _stop_impl and skip _shutdown_event.set().
             if _task is self._stop_task or _task is self._restart_task:

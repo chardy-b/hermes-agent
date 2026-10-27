@@ -61,6 +61,14 @@ class GatewayLoginCommandsMixin:
         return await loop.run_in_executor(self._login_executor(), ctx.run, func)
 
     async def _handle_login_command(self, event) -> str:
+        get_args = getattr(event, "get_command_args", None)
+        args = get_args().strip() if get_args else ""
+        if args.split()[:1] == ["claude"]:
+            try:
+                from gateway.slash_commands_claude_login import handle_claude_login
+            except ImportError:
+                return "Claude login handoff requires the Hermes messaging dependencies (aiohttp)."
+            return await handle_claude_login(self, event, args)
         src = event.source
         platform = str(getattr(src.platform, "value", src.platform)).lower()
         paired_dm = (
