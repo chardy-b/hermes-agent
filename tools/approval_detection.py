@@ -483,6 +483,19 @@ DANGEROUS_PATTERNS = [
 
 
 DANGEROUS_PATTERNS_COMPILED = [(re.compile(p, _RE_FLAGS), d) for p, d in DANGEROUS_PATTERNS]
+# Downloaded-code execution. detect_dangerous_command reports only the FIRST match and that key is what a stored
+# allowlist entry covers, so these rules are tried first: a pipeline that also contains `rm -rf` must not ride
+# on an approval of generic "recursive delete".
+REMOTE_EXECUTION_DESCRIPTIONS = frozenset({
+    "pipe remote content to shell",
+    "execute remote script via process substitution",
+    "execute remote content via command substitution",
+    "pipe remote content to PowerShell (iwr | iex)",
+    "execute remote content via Invoke-Expression",
+})
+_DANGEROUS_PATTERNS_PRIORITIZED = sorted(
+    DANGEROUS_PATTERNS_COMPILED, key=lambda pair: pair[1] not in REMOTE_EXECUTION_DESCRIPTIONS,  # stable sort
+)
 # Dynamic-word rules look for glob/brace characters, which are ordinary data inside quotes
 # (`find . -name 'log-del*'`), so they scan the quote-masked variant like the positionless hardline rules.
 _QUOTE_MASKED_DANGEROUS_DESCRIPTIONS = frozenset({
@@ -1554,7 +1567,7 @@ def detect_dangerous_command(command: str) -> tuple:
     for command_variant in _command_detection_variants(command):
         command_lower = _lower_preserving_flags(command_variant)
         masked_lower: str | None = None
-        for pattern_re, description in DANGEROUS_PATTERNS_COMPILED:
+        for pattern_re, description in _DANGEROUS_PATTERNS_PRIORITIZED:
             if description in _QUOTE_MASKED_DANGEROUS_DESCRIPTIONS:
                 if masked_lower is None:
                     masked_lower = _lower_preserving_flags(
