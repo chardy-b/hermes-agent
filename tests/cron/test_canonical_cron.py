@@ -30,7 +30,8 @@ def test_owner_ticker_uses_direct_admission_without_loopback(monkeypatch):
     import threading
 
     async def probe():
-        authority = SimpleNamespace(db=SimpleNamespace(db_path=str(get_hermes_home() / 'state.db')))
+        authority = SimpleNamespace(profile_id=str(get_hermes_home()),
+                                    db=SimpleNamespace(db_path=str(get_hermes_home() / 'state.db')))
         session_cron.bind_owner(authority)
         calls = []
 

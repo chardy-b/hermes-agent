@@ -20,12 +20,12 @@ _owners = {}
 
 
 def bind_owner(authority):
-    home = Path(authority.db.db_path).resolve().parent
+    home = Path(authority.profile_id).resolve()
     _owners[home] = (os.getpid(), authority, asyncio.get_running_loop())
 
 
 def unbind_owner(authority):
-    home = Path(authority.db.db_path).resolve().parent
+    home = Path(authority.profile_id).resolve()
     bound = _owners.get(home)
     if bound is not None and bound[1] is authority:
         del _owners[home]
@@ -284,8 +284,9 @@ async def execute(authority, ref, row, policy):
     job = dict(data['cron_job'], execution_id=execution_id)
     token = bind_execution(authority, ref.session_id, job['id'], execution_id)
     try:
-        db_path = await asyncio.to_thread(Path(authority.db.db_path).resolve)
-        with _profile_runtime_scope(db_path.parent):
+        # The authority pins the reserved profile home; state.db may live on another volume.
+        home = await asyncio.to_thread(Path(authority.profile_id).resolve)
+        with _profile_runtime_scope(home):
             result = await asyncio.to_thread(_run_identified, run_job, job, execution_id,
                                              extra_prompt=data['extra_prompt'], cancel_event=cancel)
         # run_job stamps run-side verdicts on ITS job copy (quota hold, unreachable model); the
