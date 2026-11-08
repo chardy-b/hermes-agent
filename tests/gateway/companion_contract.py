@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import jsonschema
-import yaml
+import hermes_yaml as yaml
 from referencing import Registry, Resource
 from referencing.jsonschema import DRAFT202012
 
