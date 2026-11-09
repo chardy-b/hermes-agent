@@ -192,11 +192,11 @@ async def test_a_closed_sessions_refusal_goes_with_its_live_state(tmp_path, monk
 
 # --- completions for a local session with no viewer --------------------------------------------
 
-async def _local(tmp_path, monkeypatch):
+async def _local(tmp_path, monkeypatch, *, profile_id='default'):
     from gateway.config import GatewayConfig
     from gateway.run import GatewayRunner
     from gateway.session_authority import SessionAuthority, initialize_session_authority
-    from gateway.session_contract import Principal
+    from gateway.session_contract import SessionActor
     from gateway.session_local import create_local_session
     from hermes_state import AsyncSessionDB, SessionDB
 
@@ -206,8 +206,8 @@ async def _local(tmp_path, monkeypatch):
     db = SessionDB(tmp_path / 'state.db')
     runner.session_store._db = db
     runner._session_db = AsyncSessionDB(db)
-    authority = await initialize_session_authority(runner, profile_id='default', instance_id='lc7', db=db)
-    actor = Principal('test-owner', 'default', frozenset({'session:create', 'session:submit', 'session:read'}),
+    authority = await initialize_session_authority(runner, profile_id=profile_id, instance_id='lc7', db=db)
+    actor = SessionActor('test-owner', profile_id, frozenset({'session:create', 'session:submit', 'session:read'}),
                       'fixture')
     ref = create_local_session(authority, actor, dict(request_id='lc7', source='cli', model='fixture', toolsets=[]))
     return runner, authority, ref, actor
