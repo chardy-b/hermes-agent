@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { setApiRequestConnection, setApiRequestProfile } from '@/api/client'
+import type { McpOAuthFlow } from '@/api/mcp'
 import { requestGatewayForAgent } from '@/store/gateway'
 
 import { completeMcpDesktopOAuth, McpOAuthCancelled } from './mcp-dashboard-oauth'
@@ -71,6 +72,7 @@ afterEach(() => {
   vi.resetAllMocks()
   setApiRequestConnection(null)
   setApiRequestProfile(null)
+  delete document.documentElement.dataset.hermesDesktopHost
 })
 
 describe('Desktop MCP client callback lifecycle', () => {
@@ -145,5 +147,164 @@ describe('Desktop MCP client callback lifecycle', () => {
     )
     expect(rpc.mock.calls.every(call => call[0] === 'remote-gateway' && call[1] === 'origin-profile')).toBe(true)
     expect(api).not.toHaveBeenCalled()
+  })
+})
+
+function browserPopup() {
+  const popupDocument = document.implementation.createHTMLDocument('OAuth')
+  const replace = vi.fn()
+  const close = vi.fn()
+
+  const popup = {
+    closed: false,
+    close,
+    document: popupDocument,
+    location: { replace },
+    opener: window
+  } as unknown as Window
+
+  return { close, popup, popupDocument, replace }
+}
+
+describe('browser-hosted MCP OAuth lifecycle', () => {
+  it('reserves and hardens a blank popup synchronously, then keeps the captured scope through completion', async () => {
+    document.documentElement.dataset.hermesDesktopHost = 'browser'
+    const { popup, popupDocument, replace } = browserPopup()
+    const open = vi.spyOn(window, 'open').mockReturnValue(popup)
+    const post = deferred<McpOAuthFlow>()
+
+    const api = vi.fn(async request => {
+      if (request.method === 'POST') {
+        return post.promise
+      }
+
+      return { flow_id: 'flow/one', server_name: 'reports/quarterly', status: 'approved', authorization_url: authUrl, error: null, tools }
+    })
+
+    Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: { api } })
+
+    const action = completeMcpDesktopOAuth({
+      serverName: 'reports/quarterly',
+      profile: { connectionId: 'cloud-one', profile: 'finance' },
+      sleep: async () => {}
+    })
+
+    expect(open).toHaveBeenCalledWith('', '_blank')
+    expect(open.mock.calls[0]).toHaveLength(2)
+    expect(popup.opener).toBeNull()
+    expect(popupDocument.head.querySelector('meta[name="referrer"]')?.getAttribute('content')).toBe('no-referrer')
+    expect(api).toHaveBeenCalledTimes(1)
+    expect(replace).not.toHaveBeenCalled()
+
+    post.resolve({ ...started, flow_id: 'flow/one', server_name: 'reports/quarterly', status: 'authorization_required', authorization_url: authUrl, error: null })
+    await expect(action).resolves.toMatchObject({ status: 'approved', tools })
+    expect(replace).toHaveBeenCalledWith(authUrl)
+    expect(api).toHaveBeenNthCalledWith(1, {
+      connectionId: 'cloud-one', profile: 'finance', priority: 'foreground',
+      path: '/api/mcp/servers/reports%2Fquarterly/auth', method: 'POST', timeoutMs: 60_000
+    })
+    expect(api).toHaveBeenNthCalledWith(2, {
+      connectionId: 'cloud-one', profile: 'finance', priority: 'foreground',
+      path: '/api/mcp/oauth/flows/flow%2Fone', timeoutMs: 60_000
+    })
+  })
+
+  it('continues polling after COOP severs the popup proxy and preserves the HTTPS callback', async () => {
+    document.documentElement.dataset.hermesDesktopHost = 'browser'
+    const { popup, replace, close } = browserPopup()
+    Object.defineProperty(popup, 'closed', { get: () => true })
+    vi.spyOn(window, 'open').mockReturnValue(popup)
+    const httpsAuth = `https://idp.example/authorize?redirect_uri=${encodeURIComponent('https://dashboard.example/desktop/api/mcp/oauth/callback')}`
+    let polls = 0
+
+    const api = vi.fn(async request => {
+      if (request.method === 'POST') {
+        return { flow_id: 'coop-flow', authorization_url: httpsAuth, status: 'authorization_required' }
+      }
+
+      return { flow_id: 'coop-flow', status: ++polls === 1 ? 'pending' : 'approved', tools }
+    })
+
+    Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: { api } })
+    const rpc = vi.mocked(requestGatewayForAgent)
+    await expect(completeMcpDesktopOAuth({ serverName: 'reports', sleep: async () => {} })).resolves.toMatchObject({ status: 'approved', tools })
+    expect(polls).toBe(2)
+    expect(replace).toHaveBeenCalledWith(httpsAuth)
+    expect(close).not.toHaveBeenCalled()
+    expect(rpc).not.toHaveBeenCalled()
+  })
+
+  it('deletes the original profile flow on profile change even when popup cleanup throws', async () => {
+    document.documentElement.dataset.hermesDesktopHost = 'browser'
+    const { popup, close } = browserPopup()
+    close.mockImplementation(() => { throw new DOMException('Severed proxy', 'SecurityError') })
+    vi.spyOn(window, 'open').mockReturnValue(popup)
+    setApiRequestConnection('original-gateway')
+    setApiRequestProfile('original-profile')
+    let cancelled = false
+
+    const api = vi.fn(async request => {
+      if (request.method === 'POST') {
+        return { flow_id: 'owned-flow', authorization_url: authUrl, status: 'authorization_required' }
+      }
+
+      if (request.method !== 'DELETE') {
+        setApiRequestConnection('new-gateway')
+        setApiRequestProfile('new-profile')
+        cancelled = true
+      }
+
+      return { status: 'pending' }
+    })
+
+    Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: { api } })
+    await expect(completeMcpDesktopOAuth({ serverName: 'reports', cancelled: () => cancelled })).rejects.toBeInstanceOf(McpOAuthCancelled)
+    expect(api).toHaveBeenLastCalledWith({
+      connectionId: 'original-gateway', profile: 'original-profile',
+      path: '/api/mcp/oauth/flows/owned-flow', method: 'DELETE', timeoutMs: 60_000
+    })
+    expect(api.mock.calls.every(([request]) => request.connectionId === 'original-gateway' && request.profile === 'original-profile')).toBe(true)
+  })
+
+  it('treats a null open result as blocked without retrying with noopener features', async () => {
+    document.documentElement.dataset.hermesDesktopHost = 'browser'
+    const open = vi.spyOn(window, 'open').mockReturnValue(null)
+    const api = vi.fn()
+    Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: { api } })
+
+    await expect(completeMcpDesktopOAuth({ serverName: 'reports' })).rejects.toThrow('allow popups')
+    expect(open).toHaveBeenCalledOnce()
+    expect(open.mock.calls[0]).toHaveLength(2)
+    expect(api).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['cancelled after start', authUrl, true, McpOAuthCancelled],
+    ['javascript authorization URL', 'javascript:document.cookie', false, Error],
+    ['data authorization URL', 'data:text/html,credential', false, Error]
+  ])('closes and deletes the flow when %s', async (_case, authorizationUrl, cancelAfterStart, expectedError) => {
+    document.documentElement.dataset.hermesDesktopHost = 'browser'
+    const { close, popup, replace } = browserPopup()
+    vi.spyOn(window, 'open').mockReturnValue(popup)
+    let cancelled = false
+
+    const api = vi.fn(async request => {
+      if (request.method === 'POST') {
+        cancelled = cancelAfterStart
+
+        return { flow_id: 'flow unsafe', server_name: 'reports', status: 'authorization_required', authorization_url: authorizationUrl, error: null }
+      }
+
+      return { ok: true }
+    })
+
+    Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: { api } })
+
+    await expect(completeMcpDesktopOAuth({ serverName: 'reports', cancelled: () => cancelled })).rejects.toBeInstanceOf(expectedError)
+    expect(replace).not.toHaveBeenCalled()
+    expect(close).toHaveBeenCalledOnce()
+    expect(api).toHaveBeenLastCalledWith({
+      path: '/api/mcp/oauth/flows/flow%20unsafe', method: 'DELETE', timeoutMs: 60_000
+    })
   })
 })
