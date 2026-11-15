@@ -1,7 +1,10 @@
+import { externalUrlTarget } from '@hermes/shared'
+
 import { capabilityScoped, type ProfileScope } from '@/api/client'
 import { type McpOAuthFlow, mcpOAuthRpc } from '@/api/mcp'
 
 import { isMissingRpcMethod } from './gateway-rpc'
+import { isBrowserHostedDesktop } from './platform'
 
 interface CompleteOptions {
   serverName: string
@@ -32,6 +35,130 @@ export class McpOAuthCancelled extends Error {
 const defaultSleep = (milliseconds: number) => new Promise<void>(resolve => window.setTimeout(resolve, milliseconds))
 const UPDATE_BACKEND = 'Update the Hermes backend to support Desktop MCP OAuth callbacks.'
 
+async function completeBrowserMcpOAuth({
+  serverName,
+  profile,
+  cancelled,
+  sleep = defaultSleep,
+  maxPollFailures = 3,
+  timeoutMs = 360_000
+}: CompleteOptions): Promise<McpOAuthFlow> {
+  // Reserve the tab while this call is still in the trusted click stack. Do not
+  // pass `noopener`: standards-compliant browsers may then return null even
+  // though they opened the tab, making a real tab indistinguishable from a
+  // popup blocker.
+  const popup = window.open('', '_blank')
+
+  if (!popup) {
+    throw new Error('OAuth popup was blocked — allow popups for this dashboard and retry')
+  }
+
+  popup.opener = null
+  const referrerPolicy = popup.document.createElement('meta')
+  referrerPolicy.name = 'referrer'
+  referrerPolicy.content = 'no-referrer'
+  popup.document.head.append(referrerPolicy)
+
+  const scope = capabilityScoped(profile)
+  const api = window.hermesDesktop.api
+  const deadline = Date.now() + timeoutMs
+  let flowId: string | undefined
+  let approved = false
+
+  const checkCancelled = () => {
+    if (cancelled?.()) {
+      throw new McpOAuthCancelled()
+    }
+  }
+
+  try {
+    checkCancelled()
+    const started = await api<McpOAuthFlow>({
+      ...scope,
+      path: `/api/mcp/servers/${encodeURIComponent(serverName)}/auth`,
+      method: 'POST',
+      timeoutMs: 60_000
+    })
+    flowId = started.flow_id
+    checkCancelled()
+
+    if (started.status === 'error') {
+      throw new Error(started.error || 'OAuth failed to start')
+    }
+
+    if (!flowId || !started.authorization_url) {
+      throw new Error('OAuth server did not provide an authorization URL and flow')
+    }
+
+    const target = externalUrlTarget(started.authorization_url)
+    const protocol = target?.kind === 'web' ? new URL(target.url).protocol : null
+
+    if (!target || target.kind !== 'web' || (protocol !== 'http:' && protocol !== 'https:')) {
+      throw new Error('OAuth server provided an unsafe authorization URL')
+    }
+
+    popup.location.replace(target.url)
+    let pollFailures = 0
+
+    for (;;) {
+      checkCancelled()
+
+      if (Date.now() >= deadline) {
+        throw new Error('Timed out waiting for MCP OAuth authorization')
+      }
+
+      let current: McpOAuthFlow
+
+      try {
+        current = await api<McpOAuthFlow>({
+          ...scope,
+          path: `/api/mcp/oauth/flows/${encodeURIComponent(flowId)}`,
+          timeoutMs: 60_000
+        })
+        pollFailures = 0
+      } catch (error) {
+        if (++pollFailures >= maxPollFailures) {
+          throw error
+        }
+
+        await sleep(1000)
+        continue
+      }
+
+      checkCancelled()
+
+      if (current.status === 'approved') {
+        approved = true
+
+        return current
+      }
+
+      if (current.status === 'error') {
+        throw new Error(current.error || 'OAuth authorization failed')
+      }
+
+      if (popup.closed) {
+        throw new Error('OAuth authorization window was closed before completion')
+      }
+
+      await sleep(1000)
+    }
+  } finally {
+    if (!approved) {
+      popup.close()
+
+      if (flowId) {
+        await api({
+          ...scope,
+          path: `/api/mcp/oauth/flows/${encodeURIComponent(flowId)}`,
+          method: 'DELETE',
+          timeoutMs: 60_000
+        }).catch(() => {})
+      }
+    }
+  }
+}
+
 /** Remote gateways require the Desktop callback bridge. An explicitly local
  *  gateway can host its own loopback listener when that capability is absent. */
 export async function completeMcpDesktopOAuth({
@@ -42,6 +169,10 @@ export async function completeMcpDesktopOAuth({
   maxPollFailures = 3,
   timeoutMs = 360_000
 }: CompleteOptions): Promise<McpOAuthFlow> {
+  if (isBrowserHostedDesktop()) {
+    return completeBrowserMcpOAuth({ serverName, profile, cancelled, sleep, maxPollFailures, timeoutMs })
+  }
+
   const deadline = Date.now() + timeoutMs
   const scope = capabilityScoped(profile)
   const rpc = mcpOAuthRpc(scope)
