@@ -73,12 +73,14 @@ async function completeBrowserMcpOAuth({
 
   try {
     checkCancelled()
+
     const started = await api<McpOAuthFlow>({
       ...scope,
       path: `/api/mcp/servers/${encodeURIComponent(serverName)}/auth`,
       method: 'POST',
       timeoutMs: 60_000
     })
+
     flowId = started.flow_id
     checkCancelled()
 
@@ -122,6 +124,7 @@ async function completeBrowserMcpOAuth({
         }
 
         await sleep(1000)
+
         continue
       }
 
@@ -137,15 +140,18 @@ async function completeBrowserMcpOAuth({
         throw new Error(current.error || 'OAuth authorization failed')
       }
 
-      if (popup.closed) {
-        throw new Error('OAuth authorization window was closed before completion')
-      }
-
+      // COOP can sever the WindowProxy and report `closed` while the provider
+      // tab is still authorizing. Only flow status, cancellation or timeout
+      // determines completion; the popup is not an authoritative signal.
       await sleep(1000)
     }
   } finally {
     if (!approved) {
-      popup.close()
+      try {
+        popup.close()
+      } catch {
+        // A severed/cross-origin proxy must not prevent server-side cleanup.
+      }
 
       if (flowId) {
         await api({
