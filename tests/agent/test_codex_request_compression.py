@@ -1,46 +1,52 @@
-"""Codex Responses bodies go out zstd-compressed to the official backend only (official-client parity)."""
+"""Regression coverage for uncompressed outbound Codex request bodies."""
 
+import asyncio
 import json
 
+import httpx
 import pytest
 
-from agent.process_bootstrap import build_keepalive_http_client
-
-zstd = pytest.importorskip("compression.zstd")
+from agent.process_bootstrap import build_keepalive_http_client, close_shared_transports
 
 OFFICIAL = "https://chatgpt.com/backend-api/codex"
 
 
-def _send_through_hooks(client, url: str, payload: dict):
-    request = client.build_request("POST", url, json=payload)
-    for hook in client.event_hooks["request"]:
-        hook(request)
-    return request
-
-
-def test_official_codex_responses_body_is_zstd_and_lossless():
+@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+def test_codex_responses_dispatches_raw_json(monkeypatch, async_mode):
     payload = {"model": "gpt-6.1-sol", "input": [{"role": "user", "content": "hi " * 500}]}
-    client = build_keepalive_http_client(OFFICIAL)
-    try:
-        request = _send_through_hooks(client, f"{OFFICIAL}/responses", payload)
-    finally:
-        client.close()
-    assert request.headers["Content-Encoding"] == "zstd"
-    assert int(request.headers["Content-Length"]) == len(request.content)
-    assert json.loads(zstd.decompress(request.content)) == payload
+    expected = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
+    seen = []
 
+    def respond(request):
+        seen.append(request)
+        return httpx.Response(200, json={"ok": True})
 
-@pytest.mark.parametrize("base_url, path", [
-    ("https://my-proxy.example.com/backend-api/codex", "/responses"),  # custom proxy: never compressed
-    ("https://api.openai.com/v1", "/responses"),
-    (OFFICIAL, "/models"),  # official host, non-Responses endpoint
-])
-def test_other_destinations_stay_raw_json(base_url, path):
-    payload = {"model": "x", "input": "hello"}
-    client = build_keepalive_http_client(base_url)
-    try:
-        request = _send_through_hooks(client, f"{base_url}{path}", payload)
-    finally:
-        client.close()
+    async def respond_async(request):
+        return respond(request)
+
+    close_shared_transports()
+    if async_mode:
+        monkeypatch.setattr(httpx, "AsyncHTTPTransport", lambda **kwargs: httpx.MockTransport(respond_async))
+    else:
+        monkeypatch.setattr(httpx, "HTTPTransport", lambda **kwargs: httpx.MockTransport(respond))
+    client = build_keepalive_http_client(OFFICIAL, async_mode=async_mode)
+
+    if async_mode:
+        async def send():
+            try:
+                await client.post(f"{OFFICIAL}/responses", json=payload)
+            finally:
+                await client.aclose()
+
+        asyncio.run(send())
+    else:
+        try:
+            client.post(f"{OFFICIAL}/responses", json=payload)
+        finally:
+            client.close()
+
+    assert len(seen) == 1
+    request = seen[0]
+    assert request.content == expected
     assert "Content-Encoding" not in request.headers
-    assert json.loads(request.content) == payload
+    assert request.headers["Content-Length"] == str(len(expected))
